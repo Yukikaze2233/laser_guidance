@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -170,7 +171,7 @@ public:
         open_client();
 
         const auto points_period = std::chrono::milliseconds(
-            std::max(1, this->get_parameter("packet_timeout_ms").as_int()));
+            std::max<std::int64_t>(1, this->get_parameter("packet_timeout_ms").as_int()));
         points_timer_ = this->create_wall_timer(
             points_period, std::bind(&Ws30LidarNode::poll_points, this));
         imu_timer_ = this->create_wall_timer(
