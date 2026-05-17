@@ -1,0 +1,23 @@
+services:
+  ws30-bridge:
+    build:
+      context: .
+      dockerfile: docker/ros2-jazzy-bridge.Dockerfile
+    image: laser-guidance-ros2-jazzy-bridge
+    container_name: ws30-bridge
+    network_mode: host
+    ipc: host
+    working_dir: /workspace/laser_guidance-ws30
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      REPO_ROOT: /workspace/laser_guidance-ws30
+      CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE:-Release}
+      BUILD_PARALLELISM: ${BUILD_PARALLELISM:-4}
+      FOXGLOVE_ENABLED: ${FOXGLOVE_ENABLED:-true}
+      FOXGLOVE_WS_PORT: ${FOXGLOVE_WS_PORT:-8765}
+    volumes:
+      - ./:/workspace/laser_guidance-ws30
+    command:
+      - run
+      - device_ip:=${WS30_DEVICE_IP:-192.168.137.200}
+      - publish_imu:=${WS30_PUBLISH_IMU:-true}

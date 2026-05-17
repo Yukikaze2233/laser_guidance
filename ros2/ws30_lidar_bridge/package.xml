@@ -3,7 +3,7 @@
 <package format="3">
   <name>ws30_lidar_bridge</name>
   <version>0.1.0</version>
-  <description>ROS2 bridge for WS_30PCD_ET3 solid-state lidar, wrapping rmcs_laser_guidance_core.</description>
+  <description>ROS2 bridge for WS_30PCD_ET3 solid-state lidar, wrapping ws30_lidar_core.</description>
   <maintainer email="developer@example.com">developer</maintainer>
   <license>Apache-2.0</license>
 
