@@ -85,3 +85,7 @@ guidance:
   scan_width_deg: 0.12
   scan_height_deg: 0.16
   scan_grid_n: 8
+
+ws30:
+  enabled: false
+  device_ip: "192.168.137.200"

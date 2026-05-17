@@ -135,6 +135,11 @@ struct GuidanceConfig {
     float calib_angle_y_deg = 0.0F;
 };
 
+struct Ws30Config {
+    bool enabled = false;
+    std::string device_ip = "192.168.137.200";
+};
+
 struct Config {
     V4l2Config v4l2 { };
     DebugConfig debug { };
@@ -144,6 +149,7 @@ struct Config {
     UdpConfig udp { };
     EkfConfig ekf { };
     GuidanceConfig guidance { };
+    Ws30Config ws30 { };
 };
 
 auto load_config(const std::filesystem::path& config_path) -> Config;

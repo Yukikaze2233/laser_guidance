@@ -139,6 +139,12 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.ekf.lookahead_ms = ekf["lookahead_ms"].as<double>();
     }
 
+    if (const YAML::Node ws30_cfg = yaml["ws30"]) {
+        if (ws30_cfg["enabled"]) config.ws30.enabled = ws30_cfg["enabled"].as<bool>();
+        if (ws30_cfg["device_ip"])
+            config.ws30.device_ip = ws30_cfg["device_ip"].as<std::string>();
+    }
+
     if (const YAML::Node guidance = yaml["guidance"]) {
         if (guidance["enabled"])
             config.guidance.enabled = guidance["enabled"].as<bool>();

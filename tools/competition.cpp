@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -7,6 +8,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <print>
 #include <string>
@@ -18,6 +20,8 @@
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+
+#include <ws30_lidar/client.hpp>
 
 #include "config.hpp"
 #include "types.hpp"
@@ -174,6 +178,24 @@ auto draw_hit_progress(cv::Mat& image, const rg::HitProgress& hp) -> void {
     }
     cv::putText(image, status_text, {bar_x, bar_y - 8},
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, {200, 200, 200}, 1);
+}
+
+auto draw_lidar_status(cv::Mat& image, bool connected,
+                       int point_count, float nearest_m) -> void {
+    if (!connected) {
+        cv::putText(image, "LiDAR: disconnected", {10, image.rows - 70},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 165, 255}, 2);
+        return;
+    }
+    if (point_count <= 0) {
+        cv::putText(image, "LiDAR: waiting for data...", {10, image.rows - 70},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 165, 255}, 2);
+        return;
+    }
+    const auto text = std::format("LiDAR: {} points, nearest {:.2f}m",
+                                  point_count, nearest_m);
+    cv::putText(image, text, {10, image.rows - 70},
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 255, 0}, 2);
 }
 
 auto draw_status_bar(cv::Mat& image, bool streaming, bool recording,
@@ -357,6 +379,53 @@ int main(int argc, char** argv) {
                     std::println("GuidancePipeline: ready");
                 }
             }
+        }
+
+        std::mutex lidar_mtx;
+        ws30_lidar::PointFrame latest_lidar_frame{};
+        bool lidar_connected = false;
+        std::thread lidar_thread;
+
+        if (config.ws30.enabled) {
+            lidar_thread = std::thread([&] {
+                ws30_lidar::Client client(ws30_lidar::ClientConfig{
+                    .device_ip = config.ws30.device_ip,
+                    .receive_timeout_ms = 50,
+                });
+                if (auto result = client.open(); !result) {
+                    std::println(stderr, "[ws30] open failed: {}", result.error());
+                    return;
+                }
+                if (auto result = client.request_points_stream(true); !result) {
+                    std::println(stderr, "[ws30] request points failed: {}", result.error());
+                    return;
+                }
+                std::println("[ws30] connected device={} requesting point cloud stream",
+                             config.ws30.device_ip);
+                {
+                    std::scoped_lock lock(lidar_mtx);
+                    lidar_connected = true;
+                }
+                while (running) {
+                    auto frame = client.poll_points_frame();
+                    if (!frame) {
+                        if (frame.error().find("timeout") != std::string::npos) continue;
+                        std::println(stderr, "[ws30] poll error: {}", frame.error());
+                        break;
+                    }
+                    if (!frame->has_value()) continue;
+                    {
+                        std::scoped_lock lock(lidar_mtx);
+                        latest_lidar_frame = std::move(**frame);
+                    }
+                }
+                client.close();
+                {
+                    std::scoped_lock lock(lidar_mtx);
+                    lidar_connected = false;
+                }
+                std::println("[ws30] stopped");
+            });
         }
 
         rg::RtpStreamer streamer(config.rtp);
@@ -550,6 +619,25 @@ int main(int argc, char** argv) {
                                  ekf_enabled ? guidance_msg
                                  : std::string("EKF OFF (raw)"));
             draw_hit_progress(display, hit_progress);
+
+            int lidar_points = 0;
+            float lidar_nearest = 0.0F;
+            bool lidar_ok = false;
+            {
+                std::scoped_lock lock(lidar_mtx);
+                lidar_ok = lidar_connected;
+                if (lidar_ok && !latest_lidar_frame.points.empty()) {
+                    lidar_points = static_cast<int>(latest_lidar_frame.points.size());
+                    float min_dist = std::numeric_limits<float>::max();
+                    for (const auto& p : latest_lidar_frame.points) {
+                        const float d = std::hypot(p.x_m, p.y_m, p.z_m);
+                        if (d < min_dist) min_dist = d;
+                    }
+                    lidar_nearest = min_dist;
+                }
+            }
+            draw_lidar_status(display, lidar_ok, lidar_points, lidar_nearest);
+
             draw_status_bar(display, streaming_active, recording_active, enemy_class_id,
                             active_infer.load() == infer_trt.get());
 
@@ -612,6 +700,55 @@ int main(int argc, char** argv) {
                 } else if (cmd.starts_with("ekf off")) {
                     ekf_enabled = false;
                     std::println("FIFO: EKF OFF (raw detection)");
+                } else if (cmd.starts_with("lidar on")) {
+                    if (!config.ws30.enabled) {
+                        std::println("FIFO: LiDAR not enabled in config");
+                    } else if (!lidar_thread.joinable()) {
+                        lidar_thread = std::thread([&] {
+                            ws30_lidar::Client client(ws30_lidar::ClientConfig{
+                                .device_ip = config.ws30.device_ip,
+                                .receive_timeout_ms = 50,
+                            });
+                            if (auto result = client.open(); !result) {
+                                std::println(stderr, "[ws30] open failed: {}", result.error());
+                                return;
+                            }
+                            if (auto result = client.request_points_stream(true); !result) {
+                                std::println(stderr, "[ws30] request points failed: {}", result.error());
+                                return;
+                            }
+                            std::println("[ws30] connected device={}", config.ws30.device_ip);
+                            {
+                                std::scoped_lock lock(lidar_mtx);
+                                lidar_connected = true;
+                            }
+                            while (running) {
+                                auto frame = client.poll_points_frame();
+                                if (!frame) {
+                                    if (frame.error().find("timeout") != std::string::npos) continue;
+                                    std::println(stderr, "[ws30] poll error: {}", frame.error());
+                                    break;
+                                }
+                                if (!frame->has_value()) continue;
+                                {
+                                    std::scoped_lock lock(lidar_mtx);
+                                    latest_lidar_frame = std::move(**frame);
+                                }
+                            }
+                            client.close();
+                            {
+                                std::scoped_lock lock(lidar_mtx);
+                                lidar_connected = false;
+                            }
+                            std::println("[ws30] stopped");
+                        });
+                        std::println("FIFO: LiDAR ON");
+                    }
+                } else if (cmd.starts_with("lidar off")) {
+                    if (lidar_thread.joinable()) {
+                        lidar_thread.join();
+                        std::println("FIFO: LiDAR OFF");
+                    }
                 } else if (cmd.starts_with("quit")) {
                     running = false;
                 }
@@ -641,6 +778,7 @@ int main(int argc, char** argv) {
         running = false;
         infer_cv.notify_one();
         if (infer_thread.joinable()) infer_thread.join();
+        if (lidar_thread.joinable()) lidar_thread.join();
 
         if (g_stop_requested) std::println("Signal received, shutting down…");
 
