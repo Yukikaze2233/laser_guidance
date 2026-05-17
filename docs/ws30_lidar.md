@@ -10,19 +10,19 @@ WS30 核心库已抽出为独立子模块：
 
 当前仓库已经落地的 WS30 能力：
 
-- `Ws30UdpSocket`
-- `Ws30PacketParser`
-- `Ws30FrameAssembler`
-- `Ws30Client`
-- `tool_lidar_dump`
-- `ws30_lidar_node`（ROS2 bridge）
+- `Ws30UdpSocket` / `Ws30PacketParser` / `Ws30FrameAssembler` / `Ws30Client` ✅
+- `tool_lidar_dump`（CLI 调试入口）✅
+- `ws30_lidar_node`（ROS2 bridge，已验证可发布 PointCloud2/Imu/DiagnosticArray）✅
+- 完整 Docker 容器工作流（Ubuntu Noble + ROS2 Jazzy，含 Foxglove WebSocket bridge）✅
+- Foxglove WebSocket 可视化已验证 ✅
 
-它的目标不是马上接控制链，而是先确认：
+已验证项：
 
-- UDP 收包稳定
-- points / imu / status 解析正确
-- 点云帧能稳定组装
-- 无设备时超时路径明确
+- UDP 收包稳定 ✅
+- points / imu / status 解析正确 ✅
+- 点云帧能稳定组装 ✅
+- Foxglove 3D 面板可实时看点云 ✅
+- 容器内 `foxglove_bridge` WebSocket `ws://localhost:8765` 可用 ✅
 
 当前**尚未实现**：
 
@@ -63,10 +63,29 @@ ros2 launch ws30_lidar_bridge ws30_lidar.launch.py
 ros2 run rviz2 rviz2 -d rviz/ws30_lidar.rviz
 ```
 
-在 Arch 等非 Ubuntu Noble 宿主机上，推荐直接使用容器：
+在 Arch 等非 Ubuntu Noble 宿主机上，推荐直接使用完整容器工作流：
 
 ```bash
-bash scripts/ws30_bridge_docker.sh
+docker compose -f docker-compose.ws30-bridge.yml up --build
+```
+
+例如指定设备 IP：
+
+```bash
+WS30_DEVICE_IP=192.168.137.200 docker compose -f docker-compose.ws30-bridge.yml up --build
+```
+
+Foxglove WebSocket 默认地址：
+
+```text
+ws://localhost:8765
+```
+
+只编译 / 编译后进入 shell：
+
+```bash
+docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge build
+docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge shell
 ```
 
 ## Why Standalone First

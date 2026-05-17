@@ -273,17 +273,55 @@ if (spi) {
 - `docs/ws30_lidar.md`
 - `docs/ros2_interface.md`
 
-## ROS2 Bridge via Docker
+## ROS2 Bridge via Docker ✅
 
-如果宿主机不是 Ubuntu Noble，推荐直接使用容器构建并运行 WS30 ROS2 bridge：
+已在 Arch + Docker + Foxglove 环境验证通过。
+
+如果宿主机不是 Ubuntu Noble，推荐直接使用完整容器工作流构建并运行 WS30 ROS2 bridge：
+
+```bash
+docker compose -f docker-compose.ws30-bridge.yml up --build
+```
+
+也可以用仓库脚本：
 
 ```bash
 bash scripts/ws30_bridge_docker.sh
 ```
 
-该脚本会：
+容器工作流会：
 
 1. 基于 `ros:jazzy-ros-base-noble` 构建镜像
 2. 在容器内编译 `external/ws30_lidar_core`
 3. 在容器内 `colcon build` `ros2/ws30_lidar_bridge`
 4. 通过 `--network host` 直接启动 `ros2 launch ws30_lidar_bridge ws30_lidar.launch.py`
+5. 同时启动 `foxglove_bridge`，提供 Foxglove WebSocket 连接（默认 `ws://localhost:8765`）
+
+常用环境变量：
+
+```bash
+WS30_DEVICE_IP=192.168.137.200 docker compose -f docker-compose.ws30-bridge.yml up --build
+ROS_DOMAIN_ID=7 docker compose -f docker-compose.ws30-bridge.yml up --build
+FOXGLOVE_WS_PORT=8765 docker compose -f docker-compose.ws30-bridge.yml up --build
+```
+
+也支持三种容器模式：
+
+```bash
+# 默认：编译后直接启动 bridge
+docker compose -f docker-compose.ws30-bridge.yml up --build
+
+# 只编译，不启动
+docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge build
+
+# 编译后进入容器 shell
+docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge shell
+```
+
+Foxglove WebSocket 连接地址：
+
+```text
+ws://localhost:8765
+```
+
+如果 Foxglove 在别的机器上运行，把 `localhost` 换成 Docker 宿主机 IP。

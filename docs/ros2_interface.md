@@ -29,10 +29,32 @@ cd ros2/ws30_lidar_bridge
 colcon build --packages-select ws30_lidar_bridge
 ```
 
-如果宿主机不是 Ubuntu Noble，推荐直接使用 Docker：
+如果宿主机不是 Ubuntu Noble，推荐直接使用完整 Docker 工作流：
 
 ```bash
-bash scripts/ws30_bridge_docker.sh
+docker compose -f docker-compose.ws30-bridge.yml up --build
+```
+
+常用参数通过环境变量传入：
+
+```bash
+WS30_DEVICE_IP=192.168.137.200 docker compose -f docker-compose.ws30-bridge.yml up --build
+ROS_DOMAIN_ID=7 docker compose -f docker-compose.ws30-bridge.yml up --build
+FOXGLOVE_WS_PORT=8765 docker compose -f docker-compose.ws30-bridge.yml up --build
+```
+
+容器模式：
+
+```bash
+docker compose -f docker-compose.ws30-bridge.yml up --build
+docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge build
+docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge shell
+```
+
+Foxglove 如果使用 WebSocket 连接，默认地址为：
+
+```text
+ws://localhost:8765
 ```
 
 ## Topics
@@ -83,13 +105,20 @@ ros2 launch ws30_lidar_bridge ws30_lidar.launch.py device_ip:=192.168.1.100 publ
 
 ## Visualization
 
-点云查看支持两条路径：
+点云查看推荐使用 Foxglove WebSocket 连接（容器内已内置 `foxglove_bridge`）：
 
-1. Foxglove — 直接连接 ROS2，订阅 `PointCloud2`
-2. RViz2 — 使用预置配置：
-   ```bash
-   ros2 run rviz2 rviz2 -d rviz/ws30_lidar.rviz
-   ```
+1. 打开 Foxglove → `Open connection` → 选 **Foxglove WebSocket**
+2. 地址填 `ws://localhost:8765`（远程则换宿主机 IP）
+3. 推荐面板组合：
+   - `3D` → 订阅 `/gimbal/laser_guidance/ws30/points`，Frame: `ws30_lidar`，Color: `Intensity`
+   - `Raw Messages` → 订阅 `/gimbal/laser_guidance/ws30/status`
+   - `Plot` → 订阅 `/gimbal/laser_guidance/ws30/imu`
+
+也支持 RViz2：
+
+```bash
+ros2 run rviz2 rviz2 -d rviz/ws30_lidar.rviz
+```
 
 两者都消费标准 `PointCloud2`。
 
