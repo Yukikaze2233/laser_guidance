@@ -272,3 +272,18 @@ if (spi) {
 - `docs/future_rmcs_integration.md`
 - `docs/ws30_lidar.md`
 - `docs/ros2_interface.md`
+
+## ROS2 Bridge via Docker
+
+如果宿主机不是 Ubuntu Noble，推荐直接使用容器构建并运行 WS30 ROS2 bridge：
+
+```bash
+bash scripts/ws30_bridge_docker.sh
+```
+
+该脚本会：
+
+1. 基于 `ros:jazzy-ros-base-noble` 构建镜像
+2. 在容器内编译 `external/ws30_lidar_core`
+3. 在容器内 `colcon build` `ros2/ws30_lidar_bridge`
+4. 通过 `--network host` 直接启动 `ros2 launch ws30_lidar_bridge ws30_lidar.launch.py`
