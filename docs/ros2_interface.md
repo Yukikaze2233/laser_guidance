@@ -18,15 +18,21 @@ bridge 的职责固定为：
 
 - `ros2/ws30_lidar_bridge/`
 
-它依赖 `rmcs_laser_guidance_core`（通过路径查找 `build/librmcs_laser_guidance_core.a`），但不反向污染 core。
+它只依赖 standalone `ws30_lidar_core`（通过路径查找已编译出的 `libws30_lidar_core.a`），但不反向污染 core。
 
-先编译 standalone core，再 colcon build bridge：
+先编译 standalone `ws30_lidar_core`，再 colcon build bridge：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWITH_FT4222=OFF
-cmake --build build --parallel
+cmake -S external/ws30_lidar_core -B external/ws30_lidar_core/build -DCMAKE_BUILD_TYPE=Release
+cmake --build external/ws30_lidar_core/build --parallel
 cd ros2/ws30_lidar_bridge
 colcon build --packages-select ws30_lidar_bridge
+```
+
+如果宿主机不是 Ubuntu Noble，推荐直接使用 Docker：
+
+```bash
+bash scripts/ws30_bridge_docker.sh
 ```
 
 ## Topics

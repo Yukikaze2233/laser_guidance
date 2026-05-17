@@ -53,11 +53,20 @@ WS30 核心库已抽出为独立子模块：
 启动 bridge 后在 Foxglove 或 RViz2 中实时看点云：
 
 ```bash
+cmake -S external/ws30_lidar_core -B external/ws30_lidar_core/build -DCMAKE_BUILD_TYPE=Release
+cmake --build external/ws30_lidar_core/build --parallel
+
 colcon build --packages-select ws30_lidar_bridge
 source install/setup.bash
 ros2 launch ws30_lidar_bridge ws30_lidar.launch.py
 
 ros2 run rviz2 rviz2 -d rviz/ws30_lidar.rviz
+```
+
+在 Arch 等非 Ubuntu Noble 宿主机上，推荐直接使用容器：
+
+```bash
+bash scripts/ws30_bridge_docker.sh
 ```
 
 ## Why Standalone First
