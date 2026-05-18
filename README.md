@@ -242,7 +242,7 @@ if (spi) {
 - 默认采集模式 `1920x1080 @ 60 FPS`，优先 `mjpeg` 编码
 - 默认回放样本位于 `test_data/sample_images`
 - 原始视频会话目录默认为 `videos/`
-- `models/` 放置 `.onnx`、`.engine`、电压映射模型文件（`vision_voltage_poly_v*.yaml`、`vision_voltage_lut*.yaml`）
+- `models/` 放置 `.onnx`、`.engine`、`.pt` 模型文件及电压映射模型（`vision_voltage_poly_v*.yaml`、`vision_voltage_lut*.yaml`）。YOLO 模型已纳入 git 版本控制
 - `test_data/calib/` 放置标定 CSV（voltage_records, geometry_calib_records 等）
 - `Pipeline` 通过 `inference.backend` 在 `bright_spot` / `model`(ONNX) / `tensorrt`(GPU) 间切换
 - TensorRT 需 `-DRMCS_LASER_GUIDANCE_WITH_TENSORRT=ON` 且预先生成 `.engine` 文件
@@ -259,8 +259,9 @@ if (spi) {
 - 录制输出 `raw.mp4 + session.yaml + notes.txt`，默认 H.264/avc1 编码
 - RTP 推流：`make stream` 后台 daemon + ffplay 窗口，关闭即停。`streaming` 配置段控制，默认端口 5004
 - `.script/` 提供便捷脚本：`set-config`、`scan-camera`、`preview`、`stream`、`stop`
-- WS30 当前只实现 standalone core：`Ws30UdpSocket` / `Ws30PacketParser` / `Ws30FrameAssembler` / `Ws30Client`
-- WS30 当前调试路径优先使用 `tool_lidar_dump`；ROS2 bridge、RViz/Foxglove 可视化和 PCD 导出是下一步
+- WS30 已落地 standalone core：`Ws30UdpSocket` / `Ws30PacketParser` / `Ws30FrameAssembler` / `Ws30Client` ✅
+- WS30 ROS2 bridge 已通过 Docker 容器 + Foxglove WebSocket 验证 ✅
+- WS30 点云可视化已跑通 ✅；下一步为相机-雷达外参标定与深度注入 `GuidancePipeline`
 
 ## Docs
 
