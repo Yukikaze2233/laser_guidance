@@ -6,10 +6,6 @@ videos/
 label_upload/
 .sisyphus/
 
-# model binaries
-models/*.onnx
-models/*.engine
-
 # python
 __pycache__/
 *.pyc
@@ -19,7 +15,6 @@ __pycache__/
 .idea/
 *.swp
 *.swo
-models/*.pt
 .script/.config-path
 calib_records*.csv
 hit_calib_records*.csv
