@@ -11,6 +11,7 @@
 #include <opencv2/core/types.hpp>
 
 #include "config.hpp"
+#include "guidance/lidar_depth_estimator.hpp"
 #include "guidance/voltage_mapper.hpp"
 #include "types.hpp"
 
@@ -24,6 +25,8 @@ class Ft4222Spi;
 
 class GuidancePipeline {
 public:
+    using LidarDebugInfo = LidarDepthEstimator::DebugInfo;
+
     GuidancePipeline(const Config& config, Ft4222Spi& spi);
     ~GuidancePipeline();
 
@@ -33,8 +36,9 @@ public:
     auto process(const TargetObservation& observation) -> std::string;
 
     auto process_ekf_guided(const cv::Point2f& ekf_center,
-                             const ModelCandidate* candidate,
-                             float& io_depth_mm) -> std::string;
+                            const ModelCandidate* candidate,
+                            const LidarFrame* lidar_frame,
+                            float& io_depth_mm) -> std::string;
 
     auto set_center() -> std::string;
 
@@ -45,11 +49,13 @@ public:
     auto project_to_camera(const cv::Point2f& pixel, float depth_mm) const
         -> cv::Point3f;
 
-    auto estimate_depth(const ModelCandidate& candidate) const
+    auto estimate_depth(const ModelCandidate& candidate,
+                        const LidarFrame* lidar_frame = nullptr) const
         -> std::optional<float>;
 
     [[nodiscard]] auto latest_output_angles() const -> std::optional<cv::Point2f>;
     [[nodiscard]] auto latest_output_voltages() const -> std::optional<cv::Point2f>;
+    [[nodiscard]] auto last_lidar_debug_info() const -> std::optional<LidarDebugInfo>;
 
     [[nodiscard]] auto is_initialized() const noexcept -> bool { return initialized_; }
 
@@ -73,6 +79,7 @@ private:
     Ft4222Spi& spi_;
     GuidanceConfig config_;
     std::unique_ptr<DepthEstimator> depth_estimator_;
+    std::unique_ptr<LidarDepthEstimator> lidar_depth_estimator_;
     std::unique_ptr<CameraProjection> projection_;
     std::unique_ptr<GalvoKinematics> kinematics_;
     std::unique_ptr<GalvoDriver> driver_;

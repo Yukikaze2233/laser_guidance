@@ -115,6 +115,7 @@ auto GuidancePipeline::load_calibration(const std::filesystem::path& path)
             camera.clone(), dist.clone());
         depth_estimator_ = std::make_unique<DepthEstimator>(
             config_, camera.clone());
+        lidar_depth_estimator_ = std::make_unique<LidarDepthEstimator>(config_);
         kinematics_ = std::make_unique<GalvoKinematics>(config_);
         std::println("guidance: initialized, K=[{}x{}] mirror_d={:.1f}mm t=[{:.1f},{:.1f},{:.1f}]mm",
                      camera.cols, camera.rows,
@@ -151,7 +152,14 @@ auto GuidancePipeline::process(const TargetObservation& observation) -> std::str
     }
 
     const auto& top = observation.candidates.front();
-    const auto depth = depth_estimator_->estimate(top);
+    std::optional<float> depth;
+    if (config_.depth_source == GuidanceDepthSourceKind::lidar_target_cluster
+        && lidar_depth_estimator_) {
+        depth = lidar_depth_estimator_->estimate(top, observation.lidar_frame);
+    }
+    if (!depth && depth_estimator_) {
+        depth = depth_estimator_->estimate(top);
+    }
     if (!depth) return "depth estimate failed";
 
     const auto P_c = projection_->project(top.center, *depth);
@@ -168,8 +176,9 @@ auto GuidancePipeline::process(const TargetObservation& observation) -> std::str
 }
 
 auto GuidancePipeline::process_ekf_guided(const cv::Point2f& ekf_center,
-                                            const ModelCandidate* candidate,
-                                            float& io_depth_mm) -> std::string {
+                                          const ModelCandidate* candidate,
+                                          const LidarFrame* lidar_frame,
+                                          float& io_depth_mm) -> std::string {
     if (!initialized_) return "guidance not initialized";
     if (config_.calib_mode) return "";
 
@@ -180,7 +189,15 @@ auto GuidancePipeline::process_ekf_guided(const cv::Point2f& ekf_center,
     if (candidate != nullptr
         && candidate->bbox.width > 0.0F
         && candidate->bbox.height > 0.0F) {
-        const auto depth = depth_estimator_->estimate(*candidate);
+        std::optional<float> depth;
+        if (config_.depth_source == GuidanceDepthSourceKind::lidar_target_cluster
+            && lidar_depth_estimator_
+            && lidar_frame != nullptr) {
+            depth = lidar_depth_estimator_->estimate(*candidate, *lidar_frame);
+        }
+        if (!depth && depth_estimator_) {
+            depth = depth_estimator_->estimate(*candidate);
+        }
         if (depth) {
             io_depth_mm = *depth;
         }
@@ -478,8 +495,16 @@ auto GuidancePipeline::project_to_camera(const cv::Point2f& pixel, float depth_m
     return projection_->project(pixel, depth_mm);
 }
 
-auto GuidancePipeline::estimate_depth(const ModelCandidate& candidate) const
+auto GuidancePipeline::estimate_depth(const ModelCandidate& candidate,
+                                      const LidarFrame* lidar_frame) const
     -> std::optional<float> {
+    if (config_.depth_source == GuidanceDepthSourceKind::lidar_target_cluster
+        && lidar_depth_estimator_
+        && lidar_frame != nullptr) {
+        if (const auto depth = lidar_depth_estimator_->estimate(candidate, *lidar_frame)) {
+            return depth;
+        }
+    }
     if (!depth_estimator_) return std::nullopt;
     return depth_estimator_->estimate(candidate);
 }
@@ -498,6 +523,11 @@ auto GuidancePipeline::latest_output_voltages() const -> std::optional<cv::Point
         last_output_vx_.load(std::memory_order_relaxed),
         last_output_vy_.load(std::memory_order_relaxed),
     };
+}
+
+auto GuidancePipeline::last_lidar_debug_info() const -> std::optional<LidarDebugInfo> {
+    if (!lidar_depth_estimator_) return std::nullopt;
+    return lidar_depth_estimator_->last_debug_info();
 }
 
 } // namespace rmcs_laser_guidance
