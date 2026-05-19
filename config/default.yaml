@@ -51,15 +51,16 @@ ekf:
 guidance:
   enabled: true
   command_model: geometry
+  depth_source: lidar_target_cluster
   target_geometry:
     - class_id: 0
-      width_mm: 72.0
+      width_mm: 72.5
       height_mm: 50.0
     - class_id: 1
-      width_mm: 72.0
+      width_mm: 72.5
       height_mm: 50.0
     - class_id: 2
-      width_mm: 72.0
+      width_mm: 72.5
       height_mm: 50.0
   camera_calib_path: "config/camera_calib.yaml"
   t_x_mm: -92.5
@@ -85,6 +86,10 @@ guidance:
   scan_width_deg: 0.12
   scan_height_deg: 0.16
   scan_grid_n: 8
+  lidar_bbox_margin_px: 24.0
+  lidar_cluster_tolerance_mm: 120.0
+  lidar_min_cluster_points: 8
+  lidar_max_depth_mm: 40000.0
 
 ws30:
   enabled: false

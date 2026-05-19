@@ -45,6 +45,16 @@ namespace {
             "guidance.command_model must be one of: geometry, direct_voltage");
     }
 
+    auto parse_guidance_depth_source(const std::string_view value)
+        -> GuidanceDepthSourceKind {
+        const std::string lower = to_lower_copy(std::string(value));
+        if (lower == "monocular_bbox") return GuidanceDepthSourceKind::monocular_bbox;
+        if (lower == "lidar_target_cluster") return GuidanceDepthSourceKind::lidar_target_cluster;
+
+        throw std::runtime_error(
+            "guidance.depth_source must be one of: monocular_bbox, lidar_target_cluster");
+    }
+
 } // namespace
 
 auto load_config(const std::filesystem::path& config_path) -> Config {
@@ -151,6 +161,9 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
         if (guidance["command_model"])
             config.guidance.command_model =
                 parse_guidance_command_model(guidance["command_model"].as<std::string>());
+        if (guidance["depth_source"])
+            config.guidance.depth_source =
+                parse_guidance_depth_source(guidance["depth_source"].as<std::string>());
         if (guidance["camera_calib_path"])
             config.guidance.camera_calib_path =
                 guidance["camera_calib_path"].as<std::string>();
@@ -231,6 +244,16 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.guidance.scan_height_deg = guidance["scan_height_deg"].as<float>();
         if (guidance["scan_grid_n"])
             config.guidance.scan_grid_n = guidance["scan_grid_n"].as<int>();
+        if (guidance["lidar_bbox_margin_px"])
+            config.guidance.lidar_bbox_margin_px = guidance["lidar_bbox_margin_px"].as<float>();
+        if (guidance["lidar_cluster_tolerance_mm"])
+            config.guidance.lidar_cluster_tolerance_mm =
+                guidance["lidar_cluster_tolerance_mm"].as<float>();
+        if (guidance["lidar_min_cluster_points"])
+            config.guidance.lidar_min_cluster_points =
+                guidance["lidar_min_cluster_points"].as<int>();
+        if (guidance["lidar_max_depth_mm"])
+            config.guidance.lidar_max_depth_mm = guidance["lidar_max_depth_mm"].as<float>();
         if (guidance["calib_mode"])
             config.guidance.calib_mode = guidance["calib_mode"].as<bool>();
         if (guidance["calib_angle_x_deg"])
@@ -260,6 +283,14 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
         throw std::runtime_error("runtime.debug_max_fps must be positive");
     if (config.runtime.record_queue_size <= 0)
         throw std::runtime_error("runtime.record_queue_size must be positive");
+    if (config.guidance.lidar_bbox_margin_px < 0.0F)
+        throw std::runtime_error("guidance.lidar_bbox_margin_px must be non-negative");
+    if (config.guidance.lidar_cluster_tolerance_mm <= 0.0F)
+        throw std::runtime_error("guidance.lidar_cluster_tolerance_mm must be positive");
+    if (config.guidance.lidar_min_cluster_points <= 0)
+        throw std::runtime_error("guidance.lidar_min_cluster_points must be positive");
+    if (config.guidance.lidar_max_depth_mm <= 0.0F)
+        throw std::runtime_error("guidance.lidar_max_depth_mm must be positive");
 
     return config;
 }

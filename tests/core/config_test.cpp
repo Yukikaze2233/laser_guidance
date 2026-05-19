@@ -40,9 +40,14 @@ int main() {
             "default inference backend mismatch");
         require(default_config.inference.model_path == std::filesystem::path("models/exp.onnx"),
             "default model path mismatch");
+        require(default_config.ws30.device_ip == "192.168.137.200",
+            "default ws30 device_ip mismatch");
         require(default_config.guidance.command_model
                 == rmcs_laser_guidance::GuidanceCommandModelKind::geometry,
             "default guidance command model mismatch");
+        require(default_config.guidance.depth_source
+                == rmcs_laser_guidance::GuidanceDepthSourceKind::lidar_target_cluster,
+            "default guidance depth_source mismatch");
         require(default_config.guidance.voltage_model_path
                 == std::filesystem::path("models/vision_voltage_lut.example.yaml"),
             "default guidance voltage model path mismatch");
@@ -50,6 +55,14 @@ int main() {
             "default guidance voltage_use_ekf_center mismatch");
         require_near(default_config.guidance.voltage_limit_v, 5.0F, 1e-3F,
             "default guidance voltage_limit_v mismatch");
+        require_near(default_config.guidance.lidar_bbox_margin_px, 24.0F, 1e-3F,
+            "default guidance lidar_bbox_margin_px mismatch");
+        require_near(default_config.guidance.lidar_cluster_tolerance_mm, 120.0F, 1e-3F,
+            "default guidance lidar_cluster_tolerance_mm mismatch");
+        require(default_config.guidance.lidar_min_cluster_points == 8,
+            "default guidance lidar_min_cluster_points mismatch");
+        require_near(default_config.guidance.lidar_max_depth_mm, 40000.0F, 1e-3F,
+            "default guidance lidar_max_depth_mm mismatch");
         require(default_video_session_root()
                 == (default_config_path().parent_path().parent_path() / "videos"),
             "default video session root mismatch");
@@ -142,11 +155,19 @@ int main() {
             "inference:\n"
             "  backend: model\n"
             "  model_path: models/mock_detector.onnx\n"
+            "ws30:\n"
+            "  enabled: true\n"
+            "  device_ip: 192.168.137.210\n"
             "guidance:\n"
             "  command_model: direct_voltage\n"
+            "  depth_source: lidar_target_cluster\n"
             "  voltage_model_path: models/mock_voltage.yaml\n"
             "  voltage_use_ekf_center: false\n"
-            "  voltage_limit_v: 3.5\n");
+            "  voltage_limit_v: 3.5\n"
+            "  lidar_bbox_margin_px: 12\n"
+            "  lidar_cluster_tolerance_mm: 90\n"
+            "  lidar_min_cluster_points: 5\n"
+            "  lidar_max_depth_mm: 12345\n");
         const auto override_config = rmcs_laser_guidance::load_config(override_path);
         require(override_config.v4l2.device_path == std::filesystem::path("/dev/video7"),
             "override device path mismatch");
@@ -182,9 +203,15 @@ int main() {
         require(override_config.inference.model_path
                 == std::filesystem::path("models/mock_detector.onnx"),
             "override model path mismatch");
+        require(override_config.ws30.enabled, "override ws30 enabled mismatch");
+        require(override_config.ws30.device_ip == "192.168.137.210",
+            "override ws30 device_ip mismatch");
         require(override_config.guidance.command_model
                 == rmcs_laser_guidance::GuidanceCommandModelKind::direct_voltage,
             "override guidance command model mismatch");
+        require(override_config.guidance.depth_source
+                == rmcs_laser_guidance::GuidanceDepthSourceKind::lidar_target_cluster,
+            "override guidance depth_source mismatch");
         require(override_config.guidance.voltage_model_path
                 == std::filesystem::path("models/mock_voltage.yaml"),
             "override guidance voltage model path mismatch");
@@ -192,6 +219,14 @@ int main() {
             "override guidance voltage_use_ekf_center mismatch");
         require_near(override_config.guidance.voltage_limit_v, 3.5F, 1e-3F,
             "override guidance voltage_limit_v mismatch");
+        require_near(override_config.guidance.lidar_bbox_margin_px, 12.0F, 1e-3F,
+            "override guidance lidar_bbox_margin_px mismatch");
+        require_near(override_config.guidance.lidar_cluster_tolerance_mm, 90.0F, 1e-3F,
+            "override guidance lidar_cluster_tolerance_mm mismatch");
+        require(override_config.guidance.lidar_min_cluster_points == 5,
+            "override guidance lidar_min_cluster_points mismatch");
+        require_near(override_config.guidance.lidar_max_depth_mm, 12345.0F, 1e-3F,
+            "override guidance lidar_max_depth_mm mismatch");
 
         const auto bad_framerate_path = make_temp_path("rmcs_laser_guidance_bad_framerate");
         write_text_file(bad_framerate_path,

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <filesystem>
 #include <vector>
 
@@ -93,6 +92,11 @@ enum class GuidanceCommandModelKind : int {
     direct_voltage,
 };
 
+enum class GuidanceDepthSourceKind : int {
+    monocular_bbox = 0,
+    lidar_target_cluster,
+};
+
 struct TargetGeometry {
     int class_id = 0;
     float width_mm = 150.0F;
@@ -110,6 +114,7 @@ struct GalvoWiringConfig {
 struct GuidanceConfig {
     bool enabled = false;
     GuidanceCommandModelKind command_model = GuidanceCommandModelKind::geometry;
+    GuidanceDepthSourceKind depth_source = GuidanceDepthSourceKind::monocular_bbox;
     std::vector<TargetGeometry> target_geometry {};
     std::filesystem::path camera_calib_path {};
     std::filesystem::path voltage_model_path {};
@@ -130,6 +135,10 @@ struct GuidanceConfig {
     float scan_width_deg = 1.0F;
     float scan_height_deg = 0.8F;
     int scan_grid_n = 10;
+    float lidar_bbox_margin_px = 24.0F;
+    float lidar_cluster_tolerance_mm = 120.0F;
+    int lidar_min_cluster_points = 8;
+    float lidar_max_depth_mm = 40000.0F;
     bool calib_mode = false;
     float calib_angle_x_deg = 0.0F;
     float calib_angle_y_deg = 0.0F;
