@@ -54,13 +54,13 @@ guidance:
   calib_mode: false
   target_geometry:
     - class_id: 0
-      width_mm: 72.0
+      width_mm: 72.5
       height_mm: 50.0
     - class_id: 1
-      width_mm: 72.0
+      width_mm: 72.5
       height_mm: 50.0
     - class_id: 2
-      width_mm: 72.0
+      width_mm: 72.5
       height_mm: 50.0
   voltage_model_path: "models/vision_voltage_lut_v1.yaml"
   voltage_use_ekf_center: true
