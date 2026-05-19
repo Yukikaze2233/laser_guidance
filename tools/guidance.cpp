@@ -14,6 +14,8 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <ws30_lidar/client.hpp>
+
 #include "config.hpp"
 #include "types.hpp"
 #include "example_support.hpp"
@@ -123,6 +125,45 @@ auto draw_guidance_status(cv::Mat& image, bool guidance_active,
                 cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 0}, 2);
 }
 
+auto draw_lidar_debug(cv::Mat& image,
+                      const std::optional<rg::GuidancePipeline::LidarDebugInfo>& debug) -> void {
+    if (!debug) return;
+    cv::putText(image, std::format("LIDAR ROI={} clusters={} {}",
+                                   debug->roi_points,
+                                   debug->cluster_count,
+                                   debug->has_target ? "TARGET" : "NONE"),
+                {10, 120}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 0}, 2);
+    if (!debug->has_target) return;
+    cv::putText(image, std::format("depth={:.0f}mm score={:.2f} center={:.1f}px std={:.0f}",
+                                   debug->target_depth_mm,
+                                   debug->target_score,
+                                   debug->target_center_dist_px,
+                                   debug->target_depth_std_mm),
+                {10, 145}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 0}, 2);
+    cv::putText(image, std::format("size=({:.0f},{:.0f},{:.0f})mm",
+                                   debug->target_size_x_mm,
+                                   debug->target_size_y_mm,
+                                   debug->target_size_z_mm),
+                {10, 170}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 0}, 2);
+}
+
+auto convert_ws30_frame(const ws30_lidar::PointFrame& frame) -> rg::LidarFrame {
+    rg::LidarFrame out;
+    out.timestamp_ns = frame.timestamp_ms * 1'000'000ULL;
+    out.points.reserve(frame.points.size());
+    for (const auto& p : frame.points) {
+        out.points.push_back(rg::LidarPoint{
+            .x_mm = p.x_m * 1000.0F,
+            .y_mm = p.y_m * 1000.0F,
+            .z_mm = p.z_m * 1000.0F,
+            .intensity = static_cast<float>(p.intensity),
+            .row = static_cast<std::int32_t>(p.row),
+            .col = static_cast<std::int32_t>(p.col),
+        });
+    }
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -151,6 +192,54 @@ int main(int argc, char** argv) {
 
         std::unique_ptr<rg::Ft4222Spi> spi;
         std::unique_ptr<rg::GuidancePipeline> guidance;
+        bool running = true;
+        std::mutex lidar_mtx;
+        ws30_lidar::PointFrame latest_lidar_frame{};
+        bool lidar_connected = false;
+        std::thread lidar_thread;
+
+        if (config.ws30.enabled) {
+            lidar_thread = std::thread([&] {
+                ws30_lidar::Client client(ws30_lidar::ClientConfig{
+                    .device_ip = config.ws30.device_ip,
+                    .receive_timeout_ms = 50,
+                });
+                if (auto result = client.open(); !result) {
+                    std::println(stderr, "[ws30] open failed: {}", result.error());
+                    return;
+                }
+                if (auto result = client.request_points_stream(true); !result) {
+                    std::println(stderr, "[ws30] request points failed: {}", result.error());
+                    return;
+                }
+                std::println("[ws30] connected device={} requesting point cloud stream",
+                             config.ws30.device_ip);
+                {
+                    std::scoped_lock lock(lidar_mtx);
+                    lidar_connected = true;
+                }
+                while (running) {
+                    auto frame = client.poll_points_frame();
+                    if (!frame) {
+                        if (frame.error().find("timeout") != std::string::npos) continue;
+                        std::println(stderr, "[ws30] poll error: {}", frame.error());
+                        break;
+                    }
+                    if (!frame->has_value()) continue;
+                    {
+                        std::scoped_lock lock(lidar_mtx);
+                        latest_lidar_frame = std::move(**frame);
+                    }
+                }
+                client.close();
+                {
+                    std::scoped_lock lock(lidar_mtx);
+                    lidar_connected = false;
+                }
+                std::println("[ws30] stopped");
+            });
+        }
+
         if (config.guidance.enabled) {
             auto spi_result = rg::Ft4222Spi::open(rg::Ft4222Config{
                 .sys_clock = rg::Ft4222SysClock::k60MHz,
@@ -182,7 +271,6 @@ int main(int argc, char** argv) {
         rg::EkfTracker tracker(config.ekf);
         rg::EkfState latest_ekf_state;
         std::string guidance_msg;
-        bool running = true;
 
         float last_valid_depth_mm = 0.0F;
         bool depth_valid = false;
@@ -293,6 +381,12 @@ int main(int argc, char** argv) {
                 observation = latest_observation;
                 ekf_state = latest_ekf_state;
             }
+            {
+                std::scoped_lock lock(lidar_mtx);
+                if (lidar_connected && !latest_lidar_frame.points.empty()) {
+                    observation.lidar_frame = convert_ws30_frame(latest_lidar_frame);
+                }
+            }
             if (infer) infer_cv.notify_one();
 
             if (guidance && guidance->is_initialized()) {
@@ -306,7 +400,7 @@ int main(int argc, char** argv) {
                         && config.guidance.command_model == rg::GuidanceCommandModelKind::geometry) {
                         const auto& top = observation.candidates.front();
                         if (top.bbox.width > 0.0F) {
-                            const auto depth = guidance->estimate_depth(top);
+                            const auto depth = guidance->estimate_depth(top, &observation.lidar_frame);
                             if (depth) {
                                 last_valid_depth_mm = *depth;
                                 depth_valid = true;
@@ -338,7 +432,7 @@ int main(int argc, char** argv) {
                             ekf_state.position.x + ekf_state.velocity.x * latency_s,
                             ekf_state.position.y + ekf_state.velocity.y * latency_s);
                         guidance_msg = guidance->process_ekf_guided(
-                            aim_pos, cand, last_valid_depth_mm);
+                            aim_pos, cand, &observation.lidar_frame, last_valid_depth_mm);
                     }
                 } else if (ekf_state.lost) {
                     if (!ekf_was_lost) {
@@ -367,7 +461,7 @@ int main(int argc, char** argv) {
                 && guidance->is_initialized()
                 && !config.guidance.calib_mode
                 && top_candidate != nullptr) {
-                const auto hit_depth = guidance->estimate_depth(*top_candidate);
+                const auto hit_depth = guidance->estimate_depth(*top_candidate, &observation.lidar_frame);
                 const auto hit_angles = guidance->latest_output_angles();
                 if (hit_depth && hit_angles) {
                     const auto P_c = guidance->project_to_camera(
@@ -397,6 +491,9 @@ int main(int argc, char** argv) {
                             cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 255}, 2);
             } else {
                 draw_guidance_status(display, guidance_active, ekf_ok, depth_valid, guidance_msg);
+                if (config.guidance.depth_source == rg::GuidanceDepthSourceKind::lidar_target_cluster) {
+                    draw_lidar_debug(display, guidance->last_lidar_debug_info());
+                }
             }
 
             cv::imshow("laser_guidance", display);
@@ -502,6 +599,7 @@ int main(int argc, char** argv) {
         running = false;
         infer_cv.notify_one();
         if (infer_thread.joinable()) infer_thread.join();
+        if (lidar_thread.joinable()) lidar_thread.join();
 
         if (guidance) {
             if (auto r = guidance->set_center(); !r.empty())

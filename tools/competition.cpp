@@ -144,6 +144,45 @@ auto draw_guidance_status(cv::Mat& image, bool guidance_active,
                 cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 0}, 2);
 }
 
+auto draw_lidar_debug(cv::Mat& image,
+                      const std::optional<rg::GuidancePipeline::LidarDebugInfo>& debug) -> void {
+    if (!debug) return;
+    cv::putText(image, std::format("LIDAR ROI={} clusters={} {}",
+                                   debug->roi_points,
+                                   debug->cluster_count,
+                                   debug->has_target ? "TARGET" : "NONE"),
+                {10, 120}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 0}, 2);
+    if (!debug->has_target) return;
+    cv::putText(image, std::format("depth={:.0f}mm score={:.2f} center={:.1f}px std={:.0f}",
+                                   debug->target_depth_mm,
+                                   debug->target_score,
+                                   debug->target_center_dist_px,
+                                   debug->target_depth_std_mm),
+                {10, 145}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 0}, 2);
+    cv::putText(image, std::format("size=({:.0f},{:.0f},{:.0f})mm",
+                                   debug->target_size_x_mm,
+                                   debug->target_size_y_mm,
+                                   debug->target_size_z_mm),
+                {10, 170}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 0}, 2);
+}
+
+auto convert_ws30_frame(const ws30_lidar::PointFrame& frame) -> rg::LidarFrame {
+    rg::LidarFrame out;
+    out.timestamp_ns = frame.timestamp_ms * 1'000'000ULL;
+    out.points.reserve(frame.points.size());
+    for (const auto& p : frame.points) {
+        out.points.push_back(rg::LidarPoint{
+            .x_mm = p.x_m * 1000.0F,
+            .y_mm = p.y_m * 1000.0F,
+            .z_mm = p.z_m * 1000.0F,
+            .intensity = static_cast<float>(p.intensity),
+            .row = static_cast<std::int32_t>(p.row),
+            .col = static_cast<std::int32_t>(p.col),
+        });
+    }
+    return out;
+}
+
 auto draw_hit_progress(cv::Mat& image, const rg::HitProgress& hp) -> void {
     const int bar_x = 10;
     const int bar_y = image.rows - 40;
@@ -562,6 +601,12 @@ int main(int argc, char** argv) {
                 observation = latest_observation;
                 ekf_state   = latest_ekf_state;
             }
+            {
+                std::scoped_lock lock(lidar_mtx);
+                if (lidar_connected && !latest_lidar_frame.points.empty()) {
+                    observation.lidar_frame = convert_ws30_frame(latest_lidar_frame);
+                }
+            }
             if (active_infer.load() != nullptr) infer_cv.notify_one();
 
             udp.send(observation);
@@ -580,7 +625,7 @@ int main(int argc, char** argv) {
                     if (observation.detected && !observation.candidates.empty()) {
                         auto* cand = &observation.candidates.front();
                         guidance_msg = guidance->process_ekf_guided(
-                            observation.center, cand, last_valid_depth_mm);
+                            observation.center, cand, &observation.lidar_frame, last_valid_depth_mm);
                         depth_valid = true;
                     } else if (depth_valid) {
                         guidance_msg = guidance->set_center();
@@ -599,7 +644,7 @@ int main(int argc, char** argv) {
                             ekf_state.position.x + ekf_state.velocity.x * latency_s,
                             ekf_state.position.y + ekf_state.velocity.y * latency_s);
                         guidance_msg = guidance->process_ekf_guided(
-                            aim_pos, cand, last_valid_depth_mm);
+                            aim_pos, cand, &observation.lidar_frame, last_valid_depth_mm);
                     }
                 } else if (ekf_state.lost) {
                     if (!ekf_was_lost) {
@@ -618,6 +663,10 @@ int main(int argc, char** argv) {
             draw_guidance_status(display, guidance_ok, ekf_ok, depth_valid,
                                  ekf_enabled ? guidance_msg
                                  : std::string("EKF OFF (raw)"));
+            if (guidance_ok
+                && config.guidance.depth_source == rg::GuidanceDepthSourceKind::lidar_target_cluster) {
+                draw_lidar_debug(display, guidance->last_lidar_debug_info());
+            }
             draw_hit_progress(display, hit_progress);
 
             int lidar_points = 0;
