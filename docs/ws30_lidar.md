@@ -15,6 +15,9 @@ WS30 核心库已抽出为独立子模块：
 - `ws30_lidar_node`（ROS2 bridge，已验证可发布 PointCloud2/Imu/DiagnosticArray）✅
 - 完整 Docker 容器工作流（Ubuntu Noble + ROS2 Jazzy，含 Foxglove WebSocket bridge）✅
 - Foxglove WebSocket 可视化已验证 ✅
+- `LidarDepthEstimator`（点云靶子/机身分离 + 靶子簇测距）✅
+- `GuidancePipeline` 接入点云深度（`depth_source: lidar_target_cluster`）✅
+- 分离调试 overlay（ROI 点数、聚类数、目标分数、深度、3D 尺寸）✅
 
 已验证项：
 
@@ -23,10 +26,9 @@ WS30 核心库已抽出为独立子模块：
 - 点云帧能稳定组装 ✅
 - Foxglove 3D 面板可实时看点云 ✅
 - 容器内 `foxglove_bridge` WebSocket `ws://localhost:8765` 可用 ✅
-
-当前**尚未实现**：
-
-- 与 `GuidancePipeline` 的深度融合
+- 靶子/机身分离硬筛选 + 多指标打分 ✅
+- 靶子簇深度输出（优先 median depth）✅
+- 分离结果可在 `tool_guidance` / `tool_competition` overlay 直接查看 ✅
 
 ## Current Debug Entry
 
@@ -88,6 +90,37 @@ docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge build
 docker compose -f docker-compose.ws30-bridge.yml run --rm ws30-bridge shell
 ```
 
+## 靶子/机身点云分离
+
+点云分离逻辑位于 `src/guidance/lidar_depth_estimator.cpp`，流程为：
+
+1. **ROI 裁剪** — 用视觉检测框 `bbox` 裁出目标附近点云
+2. **3D 聚类** — 对 ROI 内点做欧式聚类
+3. **硬筛选** — 过滤中心偏差过大、厚度过大、尺寸过大、深度波动过大的簇
+4. **多指标打分** — 对通过筛选的簇按居中/薄/尺寸匹配/深度稳定/密度/强度综合评分
+5. **置信判决** — 第一名分数 < 0.60 或与第二名差距 < 0.10 则拒绝
+6. **深度输出** — 优先中位深度
+
+运行时 overlay 显示（仅当 `depth_source: lidar_target_cluster`）：
+
+```text
+LIDAR ROI=... clusters=... TARGET/NONE
+depth=... score=... center=...px std=...
+size=(x,y,z)mm
+```
+
+配置参数（`guidance` 段）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `depth_source` | `monocular_bbox` | `lidar_target_cluster` 启用点云分离测距 |
+| `lidar_bbox_margin_px` | 24 | bbox ROI 扩展像素 |
+| `lidar_cluster_tolerance_mm` | 120 | 聚类邻域容差 |
+| `lidar_min_cluster_points` | 8 | 最小簇点数 |
+| `lidar_max_depth_mm` | 40000 | 最大有效深度 |
+
+靶板物理尺寸已统一为 `72.5 × 50.0 mm`，用于单目测距和簇尺寸评分。
+
 ## Why Standalone First
 
 当前优先级是确认 WS30 原始数据正确，而不是先接 ROS2 UI。
@@ -111,8 +144,6 @@ raw log 当前是自定义二进制格式：
 
 ## Current Next Step
 
-现在最合理的下一步是：
-
-1. 把 WS30 深度接入 `GuidancePipeline`
+1. 多帧稳定锁定同一目标簇，减少靶子/机身来回跳
 2. 相机-雷达外参标定
 3. 视觉-雷达深度融合

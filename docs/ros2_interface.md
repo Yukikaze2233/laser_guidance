@@ -59,20 +59,14 @@ ws://localhost:8765
 
 ## Topics
 
-当前实际 topic（namespace 下）：
+节点名 `ws30_lidar_node`，发布的 topic：
 
-- `~/points`
+- `/ws30_lidar_node/points`
   - `sensor_msgs/msg/PointCloud2`
-- `~/imu`
+- `/ws30_lidar_node/imu`
   - `sensor_msgs/msg/Imu`
-- `~/status`
+- `/ws30_lidar_node/status`
   - `diagnostic_msgs/msg/DiagnosticArray`
-
-节点 namespace 为 `/gimbal/laser_guidance/ws30`，完整路径：
-
-- `/gimbal/laser_guidance/ws30/points`
-- `/gimbal/laser_guidance/ws30/imu`
-- `/gimbal/laser_guidance/ws30/status`
 
 ## Parameters
 
@@ -105,22 +99,19 @@ ros2 launch ws30_lidar_bridge ws30_lidar.launch.py device_ip:=192.168.1.100 publ
 
 ## Visualization
 
-点云查看推荐使用 Foxglove WebSocket 连接（容器内已内置 `foxglove_bridge`）：
+点云查看推荐 Foxglove WebSocket：
 
 1. 打开 Foxglove → `Open connection` → 选 **Foxglove WebSocket**
-2. 地址填 `ws://localhost:8765`（远程则换宿主机 IP）
-3. 推荐面板组合：
-   - `3D` → 订阅 `/gimbal/laser_guidance/ws30/points`，Frame: `ws30_lidar`，Color: `Intensity`
-   - `Raw Messages` → 订阅 `/gimbal/laser_guidance/ws30/status`
-   - `Plot` → 订阅 `/gimbal/laser_guidance/ws30/imu`
+2. 地址填 `ws://localhost:8765`
+3. 添加 `3D` 面板，拖入 `/ws30_lidar_node/points`
+4. `Color mode` 选 `intensity`，`Point size` 调 3~4
+5. 添加 `Diagnostics` 面板，拖入 `/ws30_lidar_node/status`
 
 也支持 RViz2：
 
 ```bash
 ros2 run rviz2 rviz2 -d rviz/ws30_lidar.rviz
 ```
-
-两者都消费标准 `PointCloud2`。
 
 ## Deferred Items
 
