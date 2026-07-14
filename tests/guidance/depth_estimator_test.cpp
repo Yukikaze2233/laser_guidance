@@ -48,7 +48,10 @@ void test_depth_basic() {
     std::println("  depth_basic: {}mm (expected ~{}mm)", *depth, expected);
 }
 
-void test_depth_uses_max_dim() {
+void test_depth_uses_bbox_width() {
+    // The laser detection module's axis stays vertical in world space, so
+    // bbox.width (not height) tracks its ~50mm horizontal extent regardless
+    // of bbox.height. See depth_estimator.cpp for the full rationale.
     auto cfg = make_test_config(150.0F);
     auto K = make_k_matrix(2000.0, 2000.0);
     DepthEstimator estimator(cfg, K);
@@ -56,13 +59,13 @@ void test_depth_uses_max_dim() {
     ModelCandidate candidate;
     candidate.class_id = 0;
     candidate.bbox = cv::Rect2f{0, 0, 10.0F, 30.0F};
-    float expected = 2000.0F * 150.0F / 30.0F;
+    float expected = 2000.0F * 150.0F / 10.0F;
 
     auto depth = estimator.estimate(candidate);
     assert(depth.has_value());
     assert(std::abs(*depth - expected) < 1.0F);
 
-    std::println("  depth_uses_max_dim: OK");
+    std::println("  depth_uses_bbox_width: OK");
 }
 
 void test_depth_unknown_class() {
@@ -138,7 +141,7 @@ void test_depth_large_distance() {
 int main() {
     std::println("depth_estimator_test:");
     test_depth_basic();
-    test_depth_uses_max_dim();
+    test_depth_uses_bbox_width();
     test_depth_unknown_class();
     test_depth_zero_size();
     test_depth_invalid_fx();
