@@ -26,27 +26,28 @@ int main() {
         require(default_config.debug.draw_overlay, "default draw_overlay mismatch");
         require(default_config.runtime.max_input_age_ms == 25, "default max_input_age_ms mismatch");
         require(
-            default_config.runtime.max_observation_age_ms == 35,
+            default_config.runtime.max_observation_age_ms == 50,
             "default max_observation_age_ms mismatch");
         require(default_config.runtime.max_infer_fps == 60, "default max_infer_fps mismatch");
         require(default_config.runtime.warmup_frames == 30, "default warmup_frames mismatch");
         require(
-            default_config.runtime.engine_path == std::filesystem::path("models/exp.engine"),
+            default_config.runtime.engine_path
+                == std::filesystem::path("models/exp-900-901.engine"),
             "default engine_path mismatch");
         require(
             default_config.runtime.hit_confirm_frames == 3, "default hit_confirm_frames mismatch");
         require(
             default_config.runtime.hit_release_frames == 5, "default hit_release_frames mismatch");
         require(default_config.runtime.debug_enabled, "default debug_enabled mismatch");
-        require(default_config.runtime.debug_max_fps == 30, "default debug_max_fps mismatch");
+        require(default_config.runtime.debug_max_fps == 90, "default debug_max_fps mismatch");
         require(default_config.runtime.record_enabled, "default record_enabled mismatch");
         require(
             default_config.runtime.record_queue_size == 16, "default record_queue_size mismatch");
         require(
-            default_config.inference.backend == rmcs_laser_guidance::InferenceBackendKind::model,
+            default_config.inference.backend == rmcs_laser_guidance::InferenceBackendKind::tensorrt,
             "default inference backend mismatch");
         require(
-            default_config.inference.model_path == std::filesystem::path("models/exp.onnx"),
+            default_config.inference.model_path == std::filesystem::path("models/exp-900-901.onnx"),
             "default model path mismatch");
         require(default_config.zmq.port == 5555, "default zmq port mismatch");
         require(
@@ -63,6 +64,26 @@ int main() {
         require_near(
             default_config.guidance.voltage_limit_v, 5.0F, 1e-3F,
             "default guidance voltage_limit_v mismatch");
+        require(
+            default_config.guidance.scan_mode == rmcs_laser_guidance::ScanMode::rectangle,
+            "default scan_mode mismatch");
+        require_near(
+            default_config.guidance.scan_max_velocity_deg_s, 30.0F, 1e-3F,
+            "default scan_max_velocity_deg_s mismatch");
+        require_near(
+            default_config.guidance.scan_accel_deg_s2, 200.0F, 1e-3F,
+            "default scan_accel_deg_s2 mismatch");
+        require(
+            default_config.guidance.scan_sine_cycles == 3,
+            "default scan_sine_cycles mismatch");
+        require(default_config.referee.enabled, "default referee enabled mismatch");
+        require(
+            default_config.referee.zmq_address == "tcp://127.0.0.1:5561",
+            "default referee zmq_address mismatch");
+        require(
+            default_config.referee.match_duration_s == 420,
+            "default referee match_duration_s mismatch");
+        require(default_config.referee.signal_timeout_s == 5, "default referee signal_timeout_s mismatch");
         require(
             default_video_session_root()
                 == (default_config_path().parent_path().parent_path() / "videos"),
@@ -86,15 +107,18 @@ int main() {
             "default record distance tag mismatch");
         require(
             default_record_options.target_color == "red", "default record target color mismatch");
-        const auto forced_record_v4l2_config =
-            rmcs_laser_guidance::record_session_v4l2_config({
-                .device_path = "/dev/video7",
-                .width = 1280,
-                .height = 720,
-                .framerate = 59.94F,
-                .pixel_format = rmcs_laser_guidance::V4l2PixelFormat::mjpeg,
-                .invert_image = true,
-            });
+        require(
+            default_record_options.frame_format == "h264", "default record frame_format mismatch");
+        require(default_record_options.jpeg_quality == 85, "default record jpeg_quality mismatch");
+        require(default_record_options.sample_rate == 10, "default record sample_rate mismatch");
+        const auto forced_record_v4l2_config = rmcs_laser_guidance::record_session_v4l2_config({
+            .device_path = "/dev/video7",
+            .width = 1280,
+            .height = 720,
+            .framerate = 59.94F,
+            .pixel_format = rmcs_laser_guidance::V4l2PixelFormat::mjpeg,
+            .invert_image = true,
+        });
         require(
             forced_record_v4l2_config.device_path == std::filesystem::path("/dev/video7"),
             "record override device path mismatch");
@@ -131,7 +155,7 @@ int main() {
             capture_record_options.output_root == std::filesystem::path("./videos"),
             "capture record output root mismatch");
         require_near(
-            static_cast<float>(capture_record_options.duration_seconds), 240.0F, 1e-3F,
+            static_cast<float>(capture_record_options.duration_seconds), 180.0F, 1e-3F,
             "capture record duration mismatch");
         require(
             capture_record_options.lighting_tag == "indoor_lab",
@@ -143,6 +167,10 @@ int main() {
             capture_record_options.distance_tag == "20m", "capture record distance tag mismatch");
         require(
             capture_record_options.target_color == "red", "capture record target color mismatch");
+        require(
+            capture_record_options.frame_format == "jpeg", "capture record frame_format mismatch");
+        require(capture_record_options.jpeg_quality == 85, "capture record jpeg_quality mismatch");
+        require(capture_record_options.sample_rate == 10, "capture record sample_rate mismatch");
 
         const auto override_path = make_temp_path("rmcs_laser_guidance_config_override");
         write_text_file(
@@ -168,16 +196,16 @@ int main() {
                            "  debug_max_fps: 15\n"
                            "  record_enabled: true\n"
                            "  record_queue_size: 8\n"
-                            "inference:\n"
-                            "  backend: model\n"
-                            "  model_path: models/mock_detector.onnx\n"
-                            "zmq:\n"
-                            "  enabled: true\n"
-                            "  host: 127.0.0.1\n"
-                            "  port: 6001\n"
-                            "guidance:\n"
-                            "  command_model: direct_voltage\n"
-                            "  voltage_model_path: models/mock_voltage.yaml\n"
+                           "inference:\n"
+                           "  backend: model\n"
+                           "  model_path: models/mock_detector.onnx\n"
+                           "zmq:\n"
+                           "  enabled: true\n"
+                           "  host: 127.0.0.1\n"
+                           "  port: 6001\n"
+                           "guidance:\n"
+                           "  command_model: direct_voltage\n"
+                           "  voltage_model_path: models/mock_voltage.yaml\n"
                            "  voltage_use_ekf_center: false\n"
                            "  voltage_limit_v: 3.5\n");
         const auto override_config = rmcs_laser_guidance::load_config(override_path);
@@ -338,6 +366,34 @@ int main() {
             missing_path_threw = true;
         }
         require(missing_path_threw, "missing config path should throw");
+
+        const auto sine_path = make_temp_path("sine_scan");
+        write_text_file(
+            sine_path,
+            "v4l2:\n"
+            "  device_path: /dev/null\n"
+            "  width: 1920\n"
+            "  height: 1080\n"
+            "  framerate: 60\n"
+            "guidance:\n"
+            "  scan_mode: sine\n"
+            "  scan_max_velocity_deg_s: 12.5\n"
+            "  scan_accel_deg_s2: 77\n"
+            "  scan_sine_cycles: 5\n");
+        const auto sine_config = rmcs_laser_guidance::load_config(sine_path);
+        std::filesystem::remove(sine_path);
+        require(
+            sine_config.guidance.scan_mode == rmcs_laser_guidance::ScanMode::sine,
+            "sine scan_mode parse mismatch");
+        require_near(
+            sine_config.guidance.scan_max_velocity_deg_s, 12.5F, 1e-3F,
+            "sine scan_max_velocity_deg_s parse mismatch");
+        require_near(
+            sine_config.guidance.scan_accel_deg_s2, 77.0F, 1e-3F,
+            "sine scan_accel_deg_s2 parse mismatch");
+        require(
+            sine_config.guidance.scan_sine_cycles == 5,
+            "sine scan_sine_cycles parse mismatch");
 
         return 0;
     } catch (const std::exception& e) {

@@ -1,9 +1,7 @@
 #include "vision/training_data.hpp"
 #include "vision/cuda_check.hpp"
 
-#include <algorithm>
 #include <cerrno>
-#include <cctype>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -22,36 +20,17 @@
 
 #include <opencv2/core.hpp>
 
+#include "laser_guidance/support.hpp"
+
 namespace rmcs_laser_guidance {
 namespace {
 
-auto normalize_lower(std::string value) -> std::string {
-    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
-
 auto validate_video_extension(const std::filesystem::path& path) -> void {
-    const std::string extension = normalize_lower(path.extension().string());
+    const std::string extension = to_lower(path.extension().string());
     if (extension == ".mp4")
         return;
     throw std::runtime_error(
         "unsupported session video extension, expected .mp4: " + path.string());
-}
-
-auto shell_quote(std::string_view value) -> std::string {
-    std::string quoted;
-    quoted.reserve(value.size() + 2);
-    quoted.push_back('\'');
-    for (const char ch : value) {
-        if (ch == '\'')
-            quoted += "'\"'\"'";
-        else
-            quoted.push_back(ch);
-    }
-    quoted.push_back('\'');
-    return quoted;
 }
 
 auto h264_nvenc_available() -> bool {
@@ -60,10 +39,15 @@ auto h264_nvenc_available() -> bool {
     return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+auto clamp_h264_qp(const int h264_qp) -> int {
+    return std::clamp(h264_qp, 0, 51);
+}
+
 auto build_recording_ffmpeg_command(
     const int width, const int height, const double framerate,
-    const std::filesystem::path& output_path) -> std::string {
+    const std::filesystem::path& output_path, const int h264_qp) -> std::string {
     const int gop = std::max(1, static_cast<int>(framerate > 0.0 ? framerate : 80.0));
+    const int qp = clamp_h264_qp(h264_qp);
     const std::string quoted_output_path = shell_quote(output_path.string());
 
     if (cuda_device_available() && h264_nvenc_available()) {
@@ -72,12 +56,12 @@ auto build_recording_ffmpeg_command(
             "-f rawvideo -pixel_format bgr24 -video_size {}x{} "
             "-framerate {} -i pipe:0 "
             "-c:v h264_nvenc "
-            "-preset p1 -tune hq -rc constqp -qp 18 "
+            "-preset p4 -tune hq -rc constqp -qp {} "
             "-g {} -bf 0 -rc-lookahead 0 "
             "-spatial_aq 1 -temporal_aq 1 "
             "-profile:v high -pix_fmt yuv420p -movflags +faststart "
             "-f mp4 {}",
-            width, height, framerate, gop, quoted_output_path);
+            width, height, framerate, qp, gop, quoted_output_path);
     }
 
     std::println(
@@ -87,10 +71,10 @@ auto build_recording_ffmpeg_command(
         "-f rawvideo -pixel_format bgr24 -video_size {}x{} "
         "-framerate {} -i pipe:0 "
         "-c:v libx264 "
-        "-preset ultrafast -crf 18 "
+        "-preset veryfast -crf {} "
         "-g {} -pix_fmt yuv420p -movflags +faststart "
         "-f mp4 {}",
-        width, height, framerate, gop, quoted_output_path);
+        width, height, framerate, qp, gop, quoted_output_path);
 }
 
 auto validate_video_session_metadata(const VideoSessionMetadata& metadata) -> void {
@@ -157,10 +141,13 @@ auto retime_video_in_place(const std::filesystem::path& video_path, const double
 } // namespace
 
 VideoSessionRecorder::VideoSessionRecorder(
-    std::filesystem::path output_root, VideoSessionMetadata metadata)
-    : metadata_(std::move(metadata)) {
+    std::filesystem::path output_root, VideoSessionMetadata metadata, const int h264_qp,
+    const int queue_capacity)
+    : metadata_(std::move(metadata))
+    , queue_capacity_(std::max(1, queue_capacity)) {
     (void)std::signal(SIGPIPE, SIG_IGN);
     validate_video_session_metadata(metadata_);
+    metadata_.h264_qp = clamp_h264_qp(h264_qp);
 
     session_root_ = std::move(output_root) / metadata_.session_id;
     video_path_ = session_root_ / metadata_.relative_video_path;
@@ -172,15 +159,29 @@ VideoSessionRecorder::VideoSessionRecorder(
         std::filesystem::create_directories(video_path_.parent_path());
 
     const std::string command = build_recording_ffmpeg_command(
-        metadata_.width, metadata_.height, metadata_.framerate, video_path_);
+        metadata_.width, metadata_.height, metadata_.framerate, video_path_, metadata_.h264_qp);
     pipe_ = popen(command.c_str(), "w");
     if (!pipe_) {
         throw std::runtime_error(
             "failed to start recording ffmpeg: " + std::string(strerror(errno)));
     }
+    std::println(
+        stderr, "VideoSessionRecorder: {}x{} @ {:.1f}fps h264_qp={}", metadata_.width,
+        metadata_.height, metadata_.framerate, metadata_.h264_qp);
+
+    writer_ = std::jthread([this](std::stop_token) { writer_run(); });
 }
 
 VideoSessionRecorder::~VideoSessionRecorder() {
+    if (!flushed_) {
+        {
+            std::scoped_lock lock(queue_mutex_);
+            writer_stop_ = true;
+        }
+        queue_cv_.notify_all();
+        if (writer_.joinable())
+            writer_.join();
+    }
     if (pipe_)
         (void)pclose(pipe_);
 }
@@ -188,8 +189,8 @@ VideoSessionRecorder::~VideoSessionRecorder() {
 auto VideoSessionRecorder::record_frame(const cv::Mat& image) -> void {
     if (flushed_)
         throw std::runtime_error("cannot record frame after video session flush");
-    if (!pipe_)
-        throw std::runtime_error("video session pipe is not open");
+    if (writer_failed_.load())
+        return;
     if (image.empty())
         throw std::runtime_error("cannot record empty session frame");
     if (image.type() != CV_8UC3)
@@ -198,18 +199,51 @@ auto VideoSessionRecorder::record_frame(const cv::Mat& image) -> void {
         throw std::runtime_error("session frame size does not match negotiated video dimensions");
     }
 
+    {
+        std::scoped_lock lock(queue_mutex_);
+        if (queue_capacity_ > 0 && queue_.size() >= static_cast<std::size_t>(queue_capacity_)) {
+            queue_.pop_front(); // drop the oldest frame under backpressure
+        }
+        queue_.emplace_back(image.clone());
+    }
+    queue_cv_.notify_one();
+}
+
+auto VideoSessionRecorder::writer_run() -> void {
+    while (true) {
+        cv::Mat frame;
+        {
+            std::unique_lock lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] { return writer_stop_ || !queue_.empty(); });
+            if (writer_stop_ && queue_.empty())
+                break;
+            if (queue_.empty())
+                continue;
+            frame = std::move(queue_.front());
+            queue_.pop_front();
+        }
+        if (!write_frame(frame)) {
+            writer_failed_ = true;
+            std::println(stderr, "VideoSessionRecorder: writer stopped (ffmpeg exited?)");
+            break;
+        }
+    }
+}
+
+auto VideoSessionRecorder::write_frame(const cv::Mat& image) -> bool {
     const std::size_t row_bytes = static_cast<std::size_t>(image.cols) * image.elemSize();
     if (image.isContinuous()) {
         const std::size_t size = image.total() * image.elemSize();
         if (std::fwrite(image.data, 1, size, pipe_) != size)
-            throw std::runtime_error("recording pipe write failed (ffmpeg exited?)");
+            return false;
     } else {
         for (int row = 0; row < image.rows; ++row) {
             if (std::fwrite(image.ptr(row), 1, row_bytes, pipe_) != row_bytes)
-                throw std::runtime_error("recording pipe write failed (ffmpeg exited?)");
+                return false;
         }
     }
     ++recorded_frames_;
+    return true;
 }
 
 auto VideoSessionRecorder::flush(const std::int64_t duration_ms) -> void {
@@ -217,6 +251,15 @@ auto VideoSessionRecorder::flush(const std::int64_t duration_ms) -> void {
         throw std::runtime_error("video session already flushed");
     if (duration_ms < 0)
         throw std::runtime_error("video session duration must be non-negative");
+
+    // Stop the writer and drain whatever frames are still queued.
+    {
+        std::scoped_lock lock(queue_mutex_);
+        writer_stop_ = true;
+    }
+    queue_cv_.notify_all();
+    if (writer_.joinable())
+        writer_.join();
 
     if (pipe_) {
         const int rc = pclose(pipe_);

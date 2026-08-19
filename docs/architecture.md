@@ -85,6 +85,7 @@ Hik backend 继续被视为主仓库内置能力：`CaptureDevice` 直接依赖 
 - 构建 `AimSolver`
 - 构建 `GalvoExecutor`
 - 在矩形扫描模式下启用 `ScanController`
+- 扫描插补：`MotionPlanner`（梯形速度规划 + 1ms 时间片插值）、`scan_path`（矩形蛇形 / 正弦路径生成）
 
 `Ft4222Spi` 的运行时加载策略：
 - runtime（`GuidanceSession`）默认使用高速 SPI 时钟（`k60MHz / kDiv2` ≈ 30 MHz）
@@ -92,6 +93,26 @@ Hik backend 继续被视为主仓库内置能力：`CaptureDevice` 直接依赖 
 - 缺 `libft4222.so` 或缺板卡时，guidance 初始化失败但不阻塞主流程
 
 `tool_guidance` 的标定键盘、CSV 记录、purple hit edge 记录都在 `GuidanceOpsApp` 内部处理。
+
+旋转外参标定采用以下边界：
+
+- `tool_guidance` 新建几何标定文件时写入七列表头，并记录 `theta_x/y`、原始像素、正深度、`depth_source` 和 `depth_sigma_mm`。
+- 自动深度记录标记为 `bbox`；手持测距数据由操作者标记为 `rangefinder`。
+- `tool_calib_solve` 固定配置中的机械平移和镜距，外参标定期间强制 angle offset 为零，只在 Ceres `QuaternionManifold` 上优化相机到振镜旋转。
+- 最终残差使用与运行时一致的近场模型 `p_G = R_GC * (p_C - t)`；Wahba 只作诊断或显式备用初值。
+- 四列无深度和历史五列格式不再作为有效外参标定输入。
+
+## 裁判信号层
+
+`RefereeLink` 通过 ZMQ SUB 订阅裁判系统转发（radar-egui，默认 `tcp://127.0.0.1:5561`（egui PUB 5557/5558/5561 三端口广播）），主循环每帧非阻塞轮询并按 `cmd_id` 解析 JSON：
+
+- `0x0001` game_status：`game_type` / `game_progress` / `stage_remain_time` → 喂入比赛窗口状态机；
+- `0x020C` radar_mark_data：`opponent_aerial_targeted` / `opponent_aerial_countered` → 存最新值并产生反制边沿；
+- 其他 cmd_id 忽略；解析失败忽略该帧并计数（透出到 snapshot 便于诊断）。
+
+窗口状态机：有实时信号（`signal_timeout_s` 内有合法消息）时以裁判 `stage_remain_time` 为权威——`game_progress==4` 进入比赛窗口，`stage_remain_time==0` 或收到 `==5` 退出；`stage_remain_time` 在技术暂停时由裁判停表，因此本地墙钟不做硬限制。仅当断流（超过 `referee.signal_timeout_s` 无合法消息）时退化为本地 `steady_clock` 兜底（`referee.match_duration_s`，默认 420s）；本地兜底超时后须收到 `game_progress==5` 才允许下一局 re-arm。全程引导，不门控：窗口只用于 `match_started` 边沿触发 `HitProgress::reset()`（每局开局清零，防赛前紫色污染）、`match_elapsed_s` 显示与校核；`countered` 边沿触发 `HitProgress::note_official_countered()` 校核本地锁定次数；相机 lit/unlit 阶段切换与看门狗/显示继续消费 game_progress。引导执行与 HitProgress 本地计算永不门控。断流保持当前窗口状态续导（不熄灯、不提前退出），超过 `referee.signal_timeout_s`（默认 5s）未收到合法消息时置 `signal_stale` 看门狗告警（只告警，不影响任何执行）。
+
+无信号/赛外降级：从未收到合法消息或窗口外 → 纯本地计算（引导照常执行、HitProgress 照常累计）；`referee.enabled: false` → `poll()` 空转。相机 lit/unlit 阶段切换继续由 `maybe_switch_hik_profile` 读取 `hit_progress_.difficulty()` 驱动（裁判信号可用时该值已被校核同步）。
 
 ## 配置边界
 

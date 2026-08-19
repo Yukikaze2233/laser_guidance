@@ -8,6 +8,8 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include "laser_guidance/runtime.hpp"
+
 namespace rmcs_laser_guidance {
 namespace {
 
@@ -17,18 +19,20 @@ constexpr float kMinScore = 0.25F;
 
 auto class_color(int class_id) -> cv::Scalar {
     switch (class_id) {
-    case 0: return {255, 0, 255}; // purple
-    case 1: return {0, 0, 255};   // red
-    case 2: return {255, 0, 0};   // blue
+    case 0: return {0, 0, 255};     // red (BGR)
+    case 1: return {255, 0, 0};     // blue
+    case 2: return {255, 0, 255};   // purple
+    case 3: return {180, 180, 180}; // colorless
     default: return {0, 255, 0};
     }
 }
 
 auto class_name(int class_id) -> std::string {
     switch (class_id) {
-    case 0: return "purple";
-    case 1: return "red";
-    case 2: return "blue";
+    case 0: return "red";
+    case 1: return "blue";
+    case 2: return "purple";
+    case 3: return "colorless";
     default: return "?";
     }
 }
@@ -126,8 +130,8 @@ auto draw_status_bar(
     if (recording)
         line += " [REC]";
     switch (enemy_class_id) {
-    case 1: line += " [RED]"; break;
-    case 2: line += " [BLUE]"; break;
+    case 0: line += " [ENEMY RED]"; break;
+    case 1: line += " [ENEMY BLUE]"; break;
     default: break;
     }
     if (line.empty())
@@ -169,6 +173,22 @@ auto draw_hit_progress(cv::Mat& image, const HitProgress& hp) -> void {
     }
     cv::putText(
         image, status_text, {bar_x, bar_y - 8}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {200, 200, 200}, 1);
+}
+
+auto draw_referee_status(cv::Mat& image, const RefereeSnapshot& referee) -> void {
+    std::string line;
+    if (!referee.signal_available) {
+        line = "REF: no signal (local calc)";
+    } else {
+        line = std::format(
+            "REF: pg={} t={}s {}{}",
+            static_cast<int>(referee.game_progress),
+            referee.match_elapsed_s,
+            referee.signal_stale ? "[STALE] " : "",
+            referee.official_aerial_countered ? "[CT]" : "");
+    }
+    cv::putText(
+        image, line, {10, 130}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {200, 200, 200}, 1);
 }
 
 DebugRenderer::DebugRenderer(const DebugConfig& debug_config)

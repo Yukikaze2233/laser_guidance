@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
 
@@ -72,7 +74,10 @@ private:
     std::unique_ptr<ModelInfer> infer_trt_{};
     std::optional<RuntimeBackend> active_backend_{};
     bool started_ = false;
-    std::thread worker_{};
+    // Set when the worker thread dies on an exception. degraded() reports it
+    // so the control loop stops using frozen detection results.
+    std::atomic<bool> worker_failed_{false};
+    std::jthread worker_{};
 };
 
 } // namespace rmcs_laser_guidance::runtime_internal

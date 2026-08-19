@@ -14,6 +14,7 @@
 namespace rmcs_laser_guidance {
 
 class DepthEstimator;
+class DepthFilter;
 class CameraProjection;
 class GalvoKinematics;
 class VoltageMapper;
@@ -39,11 +40,15 @@ public:
     [[nodiscard]] auto initialization_error() const -> const std::string& { return init_error_; }
 
     auto solve(const AimInput& input) -> AimSolveResult;
-    auto observe_target(const Detection* detection) -> AimSolveTelemetry;
+    auto observe_target(const Detection* detection, double dt_seconds) -> AimSolveTelemetry;
     auto estimate_depth(const Detection& detection) const -> std::optional<float>;
     auto project_to_camera(const cv::Point2f& pixel, float depth_mm) const -> cv::Point3f;
-    auto reset_depth_cache() noexcept -> void { last_valid_depth_mm_ = 0.0F; }
+    auto reset_depth_cache() noexcept -> void;
     [[nodiscard]] auto cached_depth_mm() const -> std::optional<float>;
+    auto set_offset(float x_deg, float y_deg) -> void {
+        config_.angle_offset_x_deg = x_deg;
+        config_.angle_offset_y_deg = y_deg;
+    }
 
 private:
     auto load_geometry_calibration(const std::filesystem::path& path) -> std::string;
@@ -52,6 +57,7 @@ private:
 
     GuidanceConfig config_;
     std::unique_ptr<DepthEstimator> depth_estimator_;
+    std::unique_ptr<DepthFilter> depth_filter_;
     std::unique_ptr<CameraProjection> projection_;
     std::unique_ptr<GalvoKinematics> kinematics_;
     std::unique_ptr<VoltageMapper> voltage_mapper_;

@@ -10,6 +10,8 @@
 #include <opencv2/core/types.hpp>
 
 #include "config.hpp"
+#include "guidance/motion_planner.hpp"
+#include "guidance/scan_path.hpp"
 
 namespace rmcs_laser_guidance {
 
@@ -31,8 +33,7 @@ public:
     auto stop() -> void;
 
 private:
-    auto scan_rectangle_once(float cx_deg, float cy_deg) -> std::string;
-    auto scan_rectangle_once_voltage(float cx_v, float cy_v) -> std::string;
+    auto run_pass(const std::vector<std::pair<float, float>>& path) -> std::string;
     auto run() -> void;
 
     GuidanceConfig config_;
@@ -41,7 +42,7 @@ private:
     bool voltage_mode_ = false;
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::thread worker_;
+    std::jthread worker_;
     bool stop_requested_ = false;
     bool active_ = false;
     std::optional<cv::Point2f> angle_center_{};

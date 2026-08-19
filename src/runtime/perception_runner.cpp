@@ -6,12 +6,10 @@
 namespace rmcs_laser_guidance::runtime_internal {
 namespace {
 
-auto to_enemy_class_id(const EnemyColor color) -> int { return static_cast<int>(color); }
-
 auto to_enemy_color(const int class_id) -> EnemyColor {
     switch (class_id) {
-    case 1: return EnemyColor::red;
-    case 2: return EnemyColor::blue;
+    case 0: return EnemyColor::red;
+    case 1: return EnemyColor::blue;
     default: return EnemyColor::auto_select;
     }
 }
@@ -29,18 +27,32 @@ auto to_detection(const ModelCandidate& candidate) -> Detection {
     };
 }
 
-auto filter_detections(std::vector<Detection>& detections, const EnemyColor enemy_color) -> void {
-    const int enemy_class_id = to_enemy_class_id(enemy_color);
-    if (enemy_class_id < 0) {
-        return;
-    }
-    detections.erase(
-        std::remove_if(
-            detections.begin(), detections.end(),
-            [enemy_class_id](const Detection& detection) {
-                return detection.class_id != 0 && detection.class_id != enemy_class_id;
-            }),
-        detections.end());
+// Order detections so the physical guidance path prefers the RM2026
+// countermeasure targets (purple=2, colorless=3) over any other class the
+// model emits (red/blue enemy aircraft), then falls back to score order.
+// Every class stays available to guidance — this only changes selection
+// priority, never discards detections.
+auto filter_detections(std::vector<Detection>& detections, const EnemyColor /*enemy_color*/)
+    -> void {
+    const auto priority = [](const Detection& detection) -> int {
+        if (detection.class_id == 2) {
+            return 0;
+        }
+        if (detection.class_id == 3) {
+            return 1;
+        }
+        return 2;
+    };
+    std::stable_sort(
+        detections.begin(), detections.end(),
+        [&](const Detection& lhs, const Detection& rhs) {
+            const int lhs_priority = priority(lhs);
+            const int rhs_priority = priority(rhs);
+            if (lhs_priority != rhs_priority) {
+                return lhs_priority < rhs_priority;
+            }
+            return lhs.score > rhs.score;
+        });
 }
 
 auto to_detection_batch(const ModelInferResult& result) -> DetectionBatch {
@@ -92,6 +104,8 @@ auto PerceptionRunner::start() -> std::expected<void, std::string> {
         return result;
     }
 
+    worker_failed_.store(false);
+
     {
         std::scoped_lock lock(state_mutex_);
         last_error_.clear();
@@ -99,7 +113,7 @@ auto PerceptionRunner::start() -> std::expected<void, std::string> {
     }
 
     if (enabled()) {
-        worker_ = std::thread([this] { run(); });
+        worker_ = std::jthread([this](std::stop_token) { run(); });
     }
     return {};
 }
@@ -109,17 +123,14 @@ auto PerceptionRunner::submit(Frame frame) -> bool {
         return true;
     }
 
-    try {
-        frame_queue_->push(QueuedFrame{
-            .image = std::move(frame.image),
-            .capture_time = frame.timestamp,
-        });
-        return true;
-    } catch (const std::exception& e) {
-        std::scoped_lock lock(state_mutex_);
-        last_error_ = e.what();
+    if (!frame_queue_ || frame_queue_->is_shutdown()) {
         return false;
     }
+    frame_queue_->push(QueuedFrame{
+        .image = std::move(frame.image),
+        .capture_time = frame.timestamp,
+    });
+    return true;
 }
 
 auto PerceptionRunner::poll() const -> PerceptionPollResult {
@@ -142,9 +153,8 @@ auto PerceptionRunner::shutdown() -> void {
 
 auto PerceptionRunner::stop() -> void {
     shutdown();
-    if (worker_.joinable()) {
-        worker_.join();
-    }
+    worker_ = std::jthread{};
+    worker_failed_.store(false);
 
     {
         std::scoped_lock lock(state_mutex_);
@@ -169,7 +179,11 @@ auto PerceptionRunner::set_enemy_color(const EnemyColor color) -> void {
 
 auto PerceptionRunner::set_active_backend(const RuntimeBackend backend) -> bool {
     std::scoped_lock lock(state_mutex_);
-    if (!has_backend(backend)) {
+    if (backend == RuntimeBackend::tensorrt) {
+        if (infer_trt_ == nullptr) {
+            return false;
+        }
+    } else if (infer_onnx_ == nullptr) {
         return false;
     }
     active_backend_ = backend;
@@ -204,18 +218,19 @@ auto PerceptionRunner::last_error() const -> std::string {
 
 auto PerceptionRunner::degraded() const -> bool {
     std::scoped_lock lock(state_mutex_);
-    return !enabled() || !active_backend_.has_value();
+    // worker_failed_ is set without the lock by the dying worker; treat it as
+    // degraded so callers stop trusting frozen detection results.
+    return !enabled() || !active_backend_.has_value() || worker_failed_.load();
 }
 
 auto PerceptionRunner::run() -> void {
     try {
         while (true) {
-            QueuedFrame queued_frame;
-            try {
-                queued_frame = frame_queue_->pop();
-            } catch (const std::exception&) {
+            auto queued = frame_queue_->pop();
+            if (!queued.has_value()) {
                 break;
             }
+            QueuedFrame queued_frame = std::move(*queued);
 
             const auto worker_start = Clock::now();
             const auto before_infer = stale_policy_.make_before_inference_sample(
@@ -233,8 +248,20 @@ auto PerceptionRunner::run() -> void {
             if (!infer_result.has_value()) {
                 continue;
             }
+            if (!infer_result->success) {
+                std::scoped_lock lock(state_mutex_);
+                last_error_ = "perception inference failed: " + infer_result->message;
+                continue;
+            }
+            {
+                std::scoped_lock lock(state_mutex_);
+                if (last_error_.starts_with("perception inference failed: ")) {
+                    last_error_.clear();
+                }
+            }
 
             auto batch = to_detection_batch(*infer_result);
+            batch.capture_time = queued_frame.capture_time;
             EnemyColor enemy_color = EnemyColor::auto_select;
             {
                 std::scoped_lock lock(state_mutex_);
@@ -260,6 +287,12 @@ auto PerceptionRunner::run() -> void {
             const auto after_publish = stale_policy_.make_after_publish_sample(
                 queued_frame.capture_time, worker_start, infer_start, publish_time);
             if (after_publish.stale_reason != StaleReason::none) {
+                // The observation is too old to drive aiming, but the tracker
+                // has already advanced on this measurement — publish the
+                // filter state so the aim point keeps extrapolating instead of
+                // freezing on the last non-stale frame.
+                std::scoped_lock lock(result_mutex_);
+                latest_ekf_ = tracker_.state();
                 continue;
             }
 
@@ -270,6 +303,7 @@ auto PerceptionRunner::run() -> void {
     } catch (const std::exception& e) {
         std::scoped_lock lock(state_mutex_);
         last_error_ = std::string("perception worker error: ") + e.what();
+        worker_failed_.store(true);
     }
 }
 

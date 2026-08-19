@@ -7,19 +7,22 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
 
 #include "config.hpp"
+#include "laser_guidance/error.hpp"
 #include "laser_guidance/support.hpp"
 #include "types.hpp"
 namespace rmcs_laser_guidance {
 
+// Values match model armor class ids we attack: 0=Red, 1=Blue (Purple HIT is always 2).
 enum class EnemyColor : std::int32_t {
     auto_select = -1,
-    red = 1,
-    blue = 2,
+    red = 0,
+    blue = 1,
 };
 
 enum class RuntimeBackend : std::uint8_t {
@@ -27,28 +30,32 @@ enum class RuntimeBackend : std::uint8_t {
     tensorrt,
 };
 
-enum class RuntimeCommandType : std::uint8_t {
-    set_streaming,
-    set_recording,
-    set_enemy_color,
-    set_backend,
-    set_ekf,
-    shutdown,
-};
+struct CmdSetStreaming { bool enabled = false; };
+struct CmdSetRecording { bool enabled = false; };
+struct CmdSetEnemyColor { EnemyColor enemy_color = EnemyColor::auto_select; };
+struct CmdSetBackend { RuntimeBackend backend = RuntimeBackend::onnx; };
+struct CmdSetEkf { bool enabled = false; };
+struct CmdSetOffset { float x_deg = 0.0F; float y_deg = 0.0F; };
+struct CmdShutdown {};
 
-struct RuntimeCommand {
-    RuntimeCommandType type = RuntimeCommandType::shutdown;
-    bool enabled = false;
-    EnemyColor enemy_color = EnemyColor::auto_select;
-    RuntimeBackend backend = RuntimeBackend::onnx;
+using RuntimeCommand = std::variant<
+    CmdSetStreaming,
+    CmdSetRecording,
+    CmdSetEnemyColor,
+    CmdSetBackend,
+    CmdSetEkf,
+    CmdSetOffset,
+    CmdShutdown>;
 
-    static auto set_streaming(bool enabled) -> RuntimeCommand;
-    static auto set_recording(bool enabled) -> RuntimeCommand;
-    static auto set_enemy_color(EnemyColor color) -> RuntimeCommand;
-    static auto set_backend(RuntimeBackend backend) -> RuntimeCommand;
-    static auto set_ekf(bool enabled) -> RuntimeCommand;
-    static auto shutdown() -> RuntimeCommand;
-};
+namespace runtime_command {
+auto set_streaming(bool enabled) -> RuntimeCommand;
+auto set_recording(bool enabled) -> RuntimeCommand;
+auto set_enemy_color(EnemyColor color) -> RuntimeCommand;
+auto set_backend(RuntimeBackend backend) -> RuntimeCommand;
+auto set_ekf(bool enabled) -> RuntimeCommand;
+auto set_offset(float x_deg, float y_deg) -> RuntimeCommand;
+auto shutdown() -> RuntimeCommand;
+} // namespace runtime_command
 
 struct Detection {
     float score = 0.0F;
@@ -61,6 +68,8 @@ struct DetectionBatch {
     std::vector<Detection> detections{};
     bool detected = false;
     cv::Point2f selected_center{-1.0F, -1.0F};
+    // Capture time of the image that produced this batch (for display lag compensation).
+    Clock::time_point capture_time{};
 };
 
 struct TargetTrack {
@@ -131,6 +140,19 @@ struct RuntimeStatus {
     std::string last_guidance_message{};
 };
 
+struct RefereeSnapshot {
+    bool signal_available = false;
+    bool signal_stale = false;     // 超过 signal_timeout_s 未收到合法消息（看门狗告警，不影响执行）
+    std::uint8_t game_progress = 0;
+    std::uint8_t game_type = 0;
+    std::int64_t match_elapsed_s = -1;
+    std::uint16_t stage_remain_time = 0;
+    bool official_aerial_targeted = false;
+    bool official_aerial_countered = false;
+    double last_message_age_s = -1.0;
+    std::uint64_t parse_errors = 0;
+};
+
 struct RuntimeSnapshot {
     RuntimeStatus status{};
     std::optional<CaptureFormatSnapshot> negotiated_format{};
@@ -141,6 +163,7 @@ struct RuntimeSnapshot {
     std::size_t dropped_frames = 0;
     std::string active_backend_name{};
     std::filesystem::path current_recording_root{};
+    RefereeSnapshot referee{};
 };
 
 enum class CompetitionProfile : std::uint8_t {
@@ -161,11 +184,11 @@ public:
     CompetitionRuntime(const CompetitionRuntime&) = delete;
     auto operator=(const CompetitionRuntime&) -> CompetitionRuntime& = delete;
 
-    auto start() -> std::expected<void, std::string>;
-    auto run() -> std::expected<void, std::string>;
+    auto start() -> std::expected<void, Error>;
+    auto run() -> std::expected<void, Error>;
     auto stop() -> void;
     auto join() -> void;
-    auto submit_command(const RuntimeCommand& command) -> std::expected<void, std::string>;
+    auto submit_command(const RuntimeCommand& command) -> std::expected<void, Error>;
     [[nodiscard]] auto snapshot() const -> RuntimeSnapshot;
 
 private:

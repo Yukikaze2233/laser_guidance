@@ -1,6 +1,7 @@
 #include "runtime/guidance_ops_app.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <format>
 #include <print>
 
@@ -18,6 +19,9 @@ auto apply_calibration_key(GuidanceCalibrationState& state, const GuidanceConfig
     -> std::optional<std::string> {
     const bool voltage_mode = config.command_model == GuidanceCommandModelKind::direct_voltage;
     switch (key) {
+    // WASD moves the laser spot in image-view sense.
+    // With X+/Y+ aligned to camera-right/down, angle controls are natural:
+    // W = up, S = down, A = left, D = right.
     case 'w':
     case 'W':
         if (voltage_mode) {
@@ -89,17 +93,19 @@ auto format_voltage_record(
         top.score, top.class_id, manual_vx, manual_vy);
 }
 
-auto format_geometry_record(float angle_x_deg, float angle_y_deg, const cv::Point3f& point)
-    -> std::string {
+auto format_hit_record(
+    const float angle_x_deg, const float angle_y_deg, const float pixel_x, const float pixel_y,
+    const float depth_mm) -> std::string {
     return std::format(
-        "{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}\n", angle_x_deg, angle_y_deg, point.x, point.y, point.z);
+        "{:.3f},{:.3f},{:.3f},{:.3f},{:.1f}\n", angle_x_deg, angle_y_deg, pixel_x, pixel_y,
+        depth_mm);
 }
 
 auto should_record_hit_edge(
     const HitState previous_state, const HitState current_state, const Detection& top,
     const bool detected) -> bool {
     return current_state == HitState::Confirmed && previous_state != HitState::Confirmed && detected
-        && top.class_id == 0 && top.score >= 0.25F;
+        && top.class_id == 2 && top.score >= 0.25F;
 }
 
 } // namespace
@@ -110,13 +116,12 @@ GuidanceOpsApp::GuidanceOpsApp(Config config, GuidanceRecorderPaths paths)
     , capture_(config_)
     , perception_(config_)
     , calibration_state_(std::make_shared<GuidanceCalibrationState>())
-    , hit_state_machine_(
-          config_.runtime.hit_confirm_frames, config_.runtime.hit_release_frames) {
+    , hit_state_machine_(config_.runtime.hit_confirm_frames, config_.runtime.hit_release_frames) {
     calibration_state_->angle_x_deg = config_.guidance.calib_angle_x_deg;
     calibration_state_->angle_y_deg = config_.guidance.calib_angle_y_deg;
 }
 
-auto GuidanceOpsApp::run() -> std::expected<void, std::string> {
+auto GuidanceOpsApp::run() -> std::expected<void, Error> {
     if (auto result = initialize(); !result) {
         teardown();
         return result;
@@ -126,14 +131,13 @@ auto GuidanceOpsApp::run() -> std::expected<void, std::string> {
     return {};
 }
 
-auto GuidanceOpsApp::initialize() -> std::expected<void, std::string> {
+auto GuidanceOpsApp::initialize() -> std::expected<void, Error> {
     stop_requested_ = false;
     retry_policy_ = CaptureRetryPolicy{};
 
     auto format = capture_.open();
     if (!format) {
-        std::println(
-            stderr, "camera init failed: {}, will retry...", format.error());
+        std::println(stderr, "camera init failed: {}, will retry...", format_error(format.error()));
         negotiated_format_.reset();
     } else {
         negotiated_format_ = *format;
@@ -150,7 +154,7 @@ auto GuidanceOpsApp::initialize() -> std::expected<void, std::string> {
         if (!guidance) {
             std::println(
                 stderr, "guidance init failed: {}, guidance disabled",
-                guidance.error());
+                format_error(guidance.error()));
             retry_policy_.arm_guidance_retry(std::chrono::steady_clock::now());
         } else {
             guidance_ = std::move(*guidance);
@@ -159,8 +163,26 @@ auto GuidanceOpsApp::initialize() -> std::expected<void, std::string> {
 
     if (config_.guidance.calib_mode
         && config_.guidance.command_model == GuidanceCommandModelKind::geometry) {
+        if (!geometry_calibration_file_is_compatible(paths_.geometry_path)) {
+            return std::unexpected(
+                Error{
+                    .message = "geometry calibration file is not a depth-tagged seven-column CSV: "
+                             + paths_.geometry_path.string(),
+                });
+        }
         calibration_file_.open(paths_.geometry_path, std::ios::app);
+        if (!calibration_file_) {
+            return std::unexpected(
+                Error{
+                    .message = "failed to open geometry calibration file: "
+                             + paths_.geometry_path.string(),
+                });
+        }
         std::println("CALIB: saving records to {}", paths_.geometry_path.string());
+        if (calibration_file_.tellp() == 0) {
+            calibration_file_ << geometry_calibration_csv_header();
+            calibration_file_.flush();
+        }
     }
 
     if (config_.guidance.calib_mode
@@ -193,7 +215,11 @@ auto GuidanceOpsApp::teardown() -> void {
     }
     capture_.close();
     if (window_open_ && config_.debug.show_window) {
-        cv::destroyWindow(kWindowName);
+        try {
+            cv::destroyWindow(kWindowName);
+        } catch (const cv::Exception&) {
+            // QT highgui can throw if the window was already closed.
+        }
         window_open_ = false;
     }
     guidance_.reset();
@@ -222,7 +248,9 @@ auto GuidanceOpsApp::run_loop() -> void {
                 retry_policy_.arm_guidance_retry(Clock::now());
                 retry_policy_.on_reconnect_succeeded();
             } else {
-                std::println(stderr, "guidance app reconnect failed: {}", reconnect_result.error());
+                std::println(
+                    stderr, "guidance app reconnect failed: {}",
+                    format_error(reconnect_result.error()));
                 retry_policy_.on_reconnect_failed(Clock::now());
             }
             continue;
@@ -239,7 +267,8 @@ auto GuidanceOpsApp::run_loop() -> void {
                     retry_policy_.clear_guidance_retry();
                     std::println("guidance app guidance initialized");
                 } else {
-                    std::println(stderr, "guidance app retry failed: {}", guidance.error());
+                    std::println(
+                        stderr, "guidance app retry failed: {}", format_error(guidance.error()));
                     retry_policy_.defer_guidance_retry(now);
                 }
             }
@@ -247,7 +276,7 @@ auto GuidanceOpsApp::run_loop() -> void {
 
         auto frame_result = capture_.read_frame();
         if (!frame_result) {
-            std::println(stderr, "capture read failed: {}", frame_result.error());
+            std::println(stderr, "capture read failed: {}", format_error(frame_result.error()));
             if (retry_policy_.on_read_error(Clock::now())) {
                 if (guidance_) {
                     guidance_->shutdown();
@@ -260,6 +289,7 @@ auto GuidanceOpsApp::run_loop() -> void {
         }
 
         retry_policy_.on_read_success();
+        const auto t_capture = Clock::now();
 
         ControlLoopFrame frame;
         frame.frame = std::move(*frame_result);
@@ -270,6 +300,31 @@ auto GuidanceOpsApp::run_loop() -> void {
         frame.ekf_state = perception_result.ekf_state;
         frame.dropped_frames = perception_.overwrite_count();
 
+        // ~2 Hz detection status for calib diagnosis
+        {
+            static auto last_det_log = Clock::now();
+            const auto now = Clock::now();
+            if (now - last_det_log >= std::chrono::milliseconds(500)) {
+                last_det_log = now;
+                if (perception_.degraded()) {
+                    std::println(stderr, "[DETECT] degraded: {}", perception_.last_error());
+                } else if (frame.detection.detected && !frame.detection.detections.empty()) {
+                    const auto& top = frame.detection.detections.front();
+                    std::println(
+                        "[DETECT] score={:.3f} class_id={} bbox=[{:.0f}, {:.0f}, {:.0f}, {:.0f}]",
+                        top.score, top.class_id, top.bbox.x, top.bbox.y, top.bbox.width,
+                        top.bbox.height);
+                } else if (!frame.detection.detections.empty()) {
+                    const auto& top = frame.detection.detections.front();
+                    std::println(
+                        "[DETECT] below_threshold top_score={:.4f} candidates={}", top.score,
+                        frame.detection.detections.size());
+                } else {
+                    std::println("[DETECT] no_candidates");
+                }
+            }
+        }
+
         if (perception_.degraded()) {
             frame.detection = {};
             frame.ekf_state.reset();
@@ -279,7 +334,8 @@ auto GuidanceOpsApp::run_loop() -> void {
         }
 
         frame.track = select_target_track(
-            frame.detection, frame.ekf_state, config_.ekf.enabled, config_.ekf.lookahead_ms);
+            frame.detection, frame.ekf_state, config_.ekf.enabled, config_.ekf.lookahead_ms,
+            frame.frame.timestamp);
         if (guidance_) {
             frame.guidance = guidance_->execute(frame.track);
         }
@@ -291,24 +347,60 @@ auto GuidanceOpsApp::run_loop() -> void {
                 .guidance_ready = guidance_.has_value(),
                 .calibration_mode = config_.guidance.calib_mode,
                 .command_model = config_.guidance.command_model,
-                .calibration_state =
-                    config_.guidance.calib_mode ? &calibration_state() : nullptr,
+                .calibration_state = config_.guidance.calib_mode ? &calibration_state() : nullptr,
                 .streaming_active = false,
                 .recording_active = false,
                 .enemy_color = EnemyColor::auto_select,
-                .using_tensorrt =
-                    perception_.active_backend() == RuntimeBackend::tensorrt,
+                .using_tensorrt = perception_.active_backend() == RuntimeBackend::tensorrt,
             });
+        const auto t_after_overlay = Clock::now();
 
         int key = -1;
+        auto t_after_imshow = t_after_overlay;
         if (config_.debug.show_window) {
             cv::imshow(kWindowName, frame.display);
             key = cv::waitKey(1);
-            const bool window_visible =
-                cv::getWindowProperty(kWindowName, cv::WND_PROP_VISIBLE) >= 1.0;
+            t_after_imshow = Clock::now();
+            // OpenCV QT backend throws if the window was closed / never created.
+            bool window_visible = true;
+            try {
+                window_visible = cv::getWindowProperty(kWindowName, cv::WND_PROP_VISIBLE) >= 1.0;
+            } catch (const cv::Exception&) {
+                window_visible = false;
+            }
             if (should_exit_from_key(key) || !window_visible) {
                 stop_requested_ = true;
             }
+        }
+
+        // ~5 Hz latency diagnostic
+        {
+            static auto s_last_log = Clock::now();
+            static auto s_last_cap = Clock::time_point{};
+            if (t_capture - s_last_log >= std::chrono::milliseconds(200)) {
+                s_last_log = t_capture;
+                const float loop_ms =
+                    s_last_cap != Clock::time_point{}
+                        ? std::chrono::duration<float, std::milli>(t_capture - s_last_cap).count()
+                        : 0.0f;
+                const float overlay_ms =
+                    std::chrono::duration<float, std::milli>(t_after_overlay - t_capture).count();
+                const float imshow_ms =
+                    std::chrono::duration<float, std::milli>(t_after_imshow - t_after_overlay)
+                        .count();
+                const float detect_age_ms = frame.detection.capture_time != Clock::time_point{}
+                                              ? std::chrono::duration<float, std::milli>(
+                                                    t_capture - frame.detection.capture_time)
+                                                    .count()
+                                              : -1.0f;
+                std::println(
+                    stderr,
+                    "[PERF] loop={:.1f}ms ({:.0f}fps)  detect_age={:.1f}ms  overlay={:.2f}ms  "
+                    "imshow={:.2f}ms",
+                    loop_ms, loop_ms > 0.0f ? 1000.0f / loop_ms : 0.0f, detect_age_ms, overlay_ms,
+                    imshow_ms);
+            }
+            s_last_cap = t_capture;
         }
 
         handle_key(key, frame);
@@ -331,64 +423,85 @@ auto GuidanceOpsApp::handle_key(const int key, const ControlLoopFrame& frame) ->
     }
 
     maybe_record_calibration(frame);
-    if (config_.guidance.command_model == GuidanceCommandModelKind::direct_voltage
-        && frame.detection.detected && !frame.detection.detections.empty()) {
-        const auto& top = frame.detection.detections.front();
-        const auto area = top.bbox.width * top.bbox.height;
-        std::println(
-            ">>> VOLTAGE RECORD: V=({:.3f}V,{:.3f}V) center=({:.1f},{:.1f}) area={:.1f}",
-            calibration_state_->voltage_x, calibration_state_->voltage_y, top.center.x,
-            top.center.y, area);
-    } else if (frame.guidance.telemetry.selected_target_point.has_value()) {
-        const auto& point = *frame.guidance.telemetry.selected_target_point;
-        std::println(
-            ">>> RECORD: θ=({:.2f}°,{:.2f}°) P_c=({:.1f},{:.1f},{:.1f})mm",
-            calibration_state_->angle_x_deg, calibration_state_->angle_y_deg, point.x, point.y,
-            point.z);
-    }
 }
 
 auto GuidanceOpsApp::maybe_record_calibration(const ControlLoopFrame& frame) -> void {
     if (config_.guidance.command_model == GuidanceCommandModelKind::direct_voltage) {
         if (frame.detection.detected && !frame.detection.detections.empty() && voltage_file_) {
+            const auto& top = frame.detection.detections.front();
             voltage_file_ << format_voltage_record(
-                frame.frame.timestamp, frame.detection.detections.front(), calibration_state_->voltage_x,
+                frame.frame.timestamp, top, calibration_state_->voltage_x,
                 calibration_state_->voltage_y);
             voltage_file_.flush();
+            const auto area = top.bbox.width * top.bbox.height;
+            std::println(
+                ">>> VOLTAGE RECORD: V=({:.3f}V,{:.3f}V) center=({:.1f},{:.1f}) area={:.1f}",
+                calibration_state_->voltage_x, calibration_state_->voltage_y, top.center.x,
+                top.center.y, area);
+        } else {
+            std::println(
+                stderr, ">>> RECORD skipped: no detection (need target bbox for voltage calib)");
         }
         return;
     }
 
-    if (frame.guidance.telemetry.selected_target_point.has_value() && calibration_file_) {
-        calibration_file_ << format_geometry_record(
-            calibration_state_->angle_x_deg, calibration_state_->angle_y_deg,
-            *frame.guidance.telemetry.selected_target_point);
+    // Geometry calib needs a real image pixel; aim_center is (-1,-1) when undetected.
+    const auto aim = frame.track.aim_center;
+    const bool has_pixel = frame.detection.detected && aim.x >= 0.0F && aim.y >= 0.0F
+                        && !frame.detection.detections.empty();
+    if (!has_pixel) {
+        std::println(
+            stderr,
+            ">>> RECORD skipped: no valid detection pixel (aim=({:.1f},{:.1f}) detected={} n={}). "
+            "Wait for bbox on target, then press space.",
+            aim.x, aim.y, frame.detection.detected, frame.detection.detections.size());
+        return;
+    }
+
+    if (calibration_file_) {
+        const float depth = frame.guidance.telemetry.measured_depth_mm.value_or(0.0F);
+        const auto& top = frame.detection.detections.front();
+        // Prefer raw detection center (not EKF-extrapolated aim) for extrinsic solve.
+        const float px = top.center.x;
+        const float py = top.center.y;
+        if (!std::isfinite(depth) || depth <= 0.0F) {
+            std::println(stderr, ">>> RECORD skipped: depth must be positive and finite");
+            return;
+        }
+        calibration_file_ << format_bbox_geometry_calibration_record(
+            calibration_state_->angle_x_deg, calibration_state_->angle_y_deg, px, py, depth);
         calibration_file_.flush();
+        std::println(
+            ">>> RECORD: θ=({:.2f}°,{:.2f}°) pixel=({:.1f},{:.1f}) depth={:.0f}mm class={} "
+            "score={:.2f}",
+            calibration_state_->angle_x_deg, calibration_state_->angle_y_deg, px, py, depth,
+            top.class_id, top.score);
     }
 }
 
 auto GuidanceOpsApp::maybe_record_hit_edge(const ControlLoopFrame& frame) -> void {
-    const auto* top = frame.detection.detections.empty() ? nullptr : &frame.detection.detections.front();
-    const bool is_purple = frame.detection.detected && top != nullptr && top->class_id == 0
-                        && top->score >= 0.25F;
+    const auto* top =
+        frame.detection.detections.empty() ? nullptr : &frame.detection.detections.front();
+    const bool is_purple =
+        frame.detection.detected && top != nullptr && top->class_id == 2 && top->score >= 0.25F;
     const auto hit_state = hit_state_machine_.update(is_purple);
     const auto previous = last_hit_state_;
     last_hit_state_ = hit_state;
 
     if (config_.guidance.calib_mode || top == nullptr
         || !should_record_hit_edge(previous, hit_state, *top, frame.detection.detected)
-        || !frame.guidance.aim_output.output_angles.has_value()
-        || !frame.guidance.telemetry.selected_target_point.has_value()) {
+        || !frame.guidance.aim_output.output_angles.has_value()) {
         return;
     }
 
     const auto& hit_angles = *frame.guidance.aim_output.output_angles;
-    const auto& point = *frame.guidance.telemetry.selected_target_point;
+    const float depth = frame.guidance.telemetry.active_depth_mm.value_or(0.0F);
     std::println(
-        ">>> HIT-CALIB RECORD: θ=({:.2f}°,{:.2f}°) P_c=({:.1f},{:.1f},{:.1f})mm class=purple",
-        hit_angles.x, hit_angles.y, point.x, point.y, point.z);
+        ">>> HIT-CALIB RECORD: θ=({:.2f}°,{:.2f}°) pixel=({:.1f},{:.1f}) depth={:.0f}mm",
+        hit_angles.x, hit_angles.y, frame.track.aim_center.x, frame.track.aim_center.y, depth);
     if (hit_file_) {
-        hit_file_ << format_geometry_record(hit_angles.x, hit_angles.y, point);
+        hit_file_ << format_hit_record(
+            hit_angles.x, hit_angles.y, frame.track.aim_center.x, frame.track.aim_center.y, depth);
         hit_file_.flush();
     }
 }

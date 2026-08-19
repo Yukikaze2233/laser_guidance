@@ -13,7 +13,7 @@ auto drive_until_locked(rmcs_laser_guidance::HitProgress& hp, const int expected
     using rmcs_laser_guidance::tests::require;
 
     for (int i = 0; i < 64 && !hp.is_locked(); ++i)
-        hp.update(true, kTick);
+        hp.update(true, false, kTick);
 
     require(hp.is_locked(), "expected lock to trigger");
     require(hp.lock_count() == expected_lock_count, "unexpected lock count after trigger");
@@ -51,6 +51,29 @@ int main() {
             HitProgress hp;
             hp.update(false, 2.0F);
             require(hp.progress() == 0.0F, "decay clamped at 0");
+        }
+
+        {
+            HitProgress hp;
+            hp.update(false, true, kTick);
+            hp.update(false, true, kTick);
+            require(hp.lock_count() == 0, "colorless alone must not lock");
+            require(!hp.is_locked(), "colorless alone must not enter locked state");
+        }
+
+        {
+            // RM2026 §5.6.3: P reaching P0 locks immediately; colorless is not
+            // part of the confirmation path (it is a rule attribute of the
+            // target, not a local detection signal).
+            HitProgress hp;
+            for (int i = 0; i < 12; ++i)
+                hp.update(true, false, kTick);
+            require(hp.progress() < hp.p0(), "12 ticks stay below P0");
+            hp.update(true, false, kTick);
+            require(hp.lock_count() == 1, "P0 must lock immediately without colorless");
+            require(hp.is_locked(), "lock triggered at P0");
+            require(hp.difficulty() == 2, "first lock advances to difficulty 2");
+            require(hp.progress() == 0.0F, "P resets on lock");
         }
 
         {
@@ -98,9 +121,9 @@ int main() {
                 hp.update(true, kTick);
             require_near(hp.progress(), 46.8F, 0.05F, "12 ticks: 0.6*(1..12)=46.8");
             require(hp.progress() < 50.0F, "P < P0 after 12 ticks");
-            hp.update(true, kTick);
-            require(hp.lock_count() == 1, "13th tick crosses P0=50");
-            require(hp.is_locked(), "lock triggered");
+            hp.update(true, false, kTick);
+            require(hp.lock_count() == 1, "13th tick crosses P0 and locks");
+            require(hp.is_locked(), "lock triggered at P0");
             require(hp.progress() == 0.0F, "P resets on lock");
             require(hp.stage() == 1, "stage advances to 1");
             require(hp.difficulty() == 2, "difficulty 2 before second lock");
@@ -153,10 +176,122 @@ int main() {
 
         {
             HitProgress hp;
+            const int expected_difficulties[] = {1, 2, 2, 3, 3};
+            for (int expected_lock = 1; expected_lock <= 5; ++expected_lock) {
+                require(
+                    hp.difficulty() == expected_difficulties[expected_lock - 1],
+                    "difficulty sequence must remain 1, 2, 2, 3, 3");
+                drive_until_locked(hp, expected_lock);
+                expire_lock(hp);
+            }
+            require(hp.is_exhausted(), "five confirmed locks exhaust progress");
+        }
+
+        {
+            HitProgress hp;
+            for (int lock = 1; lock <= 3; ++lock) {
+                drive_until_locked(hp, lock);
+                expire_lock(hp);
+            }
+            require(hp.difficulty() == 3, "third confirmation enters difficulty 3");
+            for (int i = 0; i < 64 && !hp.is_locked(); ++i)
+                hp.update(false, true, kTick);
+            require(hp.lock_count() == 4, "colorless HitProgress confirms fourth lock");
+        }
+
+        {
+            HitProgress hp;
             hp.update(true, 0.8F);
             require(hp.progress_ratio() > 0.0F, "ratio > 0 when hitting");
             hp.update(false, 2.0F);
             require(hp.progress_ratio() < 1.0F, "ratio < 1.0 during decay");
+        }
+
+        {
+            HitProgress hp;
+            for (int i = 0; i < 20; ++i)
+                hp.update(true, kTick);
+            hp.update(false, 2.0F);
+            require(hp.lock_count() > 0 || hp.progress() > 0.0F, "state dirty before reset");
+            hp.reset();
+            require(hp.progress() == 0.0F, "reset clears P");
+            require(hp.stage() == 0, "reset clears stage");
+            require(hp.difficulty() == 1, "reset restores difficulty 1");
+            require(hp.p0() == 50.0F, "reset restores P0 50");
+            require(hp.lock_count() == 0, "reset clears lock_count");
+            require(!hp.is_locked(), "reset clears locked");
+            require(!hp.is_exhausted(), "reset clears exhausted");
+            require(!hp.is_hitting(), "reset clears hitting");
+        }
+
+        {
+            HitProgress hp;
+            hp.update(true, 45.0F);
+            require(hp.is_locked(), "precondition: locked");
+            require(!hp.note_official_countered(), "already locked -> no correction");
+            require(hp.lock_count() == 1, "lock_count unchanged when already counted");
+        }
+
+        {
+            HitProgress hp;
+            hp.update(true, 0.5F);              // P = 9.0, 未锁定
+            require(hp.note_official_countered(), "missed lock -> corrected");
+            require(hp.is_locked(), "correction enters locked state");
+            require(hp.lock_count() == 1, "correction increments lock_count");
+            require(hp.stage() == 1, "correction advances stage");
+            require(hp.difficulty() == 2, "correction advances difficulty");
+            require(hp.progress() == 0.0F, "correction resets P");
+            require_near(hp.lock_remaining_s(), 45.0F, 0.5F, "correction starts 45s lock");
+            hp.update(false, 45.1F);
+            require(!hp.is_locked(), "corrected lock expires after 45s");
+        }
+
+        {
+            HitProgress hp;
+            for (int lock = 1; lock <= 5; ++lock) {
+                drive_until_locked(hp, lock);
+                expire_lock(hp);
+            }
+            require(hp.is_exhausted(), "precondition: exhausted");
+            require(!hp.note_official_countered(), "exhausted -> no correction");
+            require(hp.lock_count() == 5, "lock_count capped at 5");
+        }
+
+        {
+            // 官方反制次数同步：窗口内以裁判计数为准推进阶段
+            HitProgress hp;
+            hp.sync_official_counter(0);
+            require(hp.difficulty() == 1, "official 0 -> difficulty 1");
+            require_near(hp.p0(), 50.0F, 0.01F, "difficulty 1 P0 = 50");
+
+            hp.sync_official_counter(1);
+            require(hp.lock_count() == 1, "official 1 -> lock_count 1");
+            require(hp.difficulty() == 2, "official 1 -> difficulty 2");
+            require_near(hp.p0(), 100.0F, 0.01F, "difficulty 2 P0 = 100");
+            require(hp.is_locked(), "official advance triggers 45s lock");
+            require_near(hp.lock_remaining_s(), 45.0F, 0.5F, "lock timer 45s");
+
+            hp.sync_official_counter(2);
+            require(hp.difficulty() == 2, "official 2 -> difficulty 2");
+
+            hp.sync_official_counter(3);
+            require(hp.difficulty() == 3, "official 3 -> difficulty 3 (unlit)");
+
+            hp.sync_official_counter(5);
+            require(hp.lock_count() == 5, "official 5 -> lock_count 5");
+            require(hp.is_locked(), "5th counter still locks for 45s");
+            hp.update(false, 45.1F);
+            require(hp.is_exhausted(), "exhausted after 5th lock expires");
+        }
+
+        {
+            // 官方同步不丢边沿：本地锁定期内同步新计数仍生效
+            HitProgress hp;
+            hp.update(true, 0.5F);              // P = 9.0
+            hp.sync_official_counter(1);        // 官方已反制一次（本地可能漏检）
+            require(hp.lock_count() == 1, "sync works even if local missed");
+            require(hp.is_locked(), "sync starts lock");
+            require(hp.progress() == 0.0F, "sync resets P");
         }
 
         return 0;

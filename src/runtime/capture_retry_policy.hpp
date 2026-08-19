@@ -16,7 +16,9 @@ public:
 
     explicit CaptureRetryPolicy(
         int max_consecutive_errors = 3,
-        Clock::duration reconnect_retry_delay = std::chrono::seconds(1),
+        // 重连退避 3s：Hik SDK open 会触发内核 USB reset，相机重新枚举需
+        // 1-3s；1s 退避会撞上枚举窗口导致 "No device matches" 循环失败。
+        Clock::duration reconnect_retry_delay = std::chrono::seconds(3),
         Clock::duration guidance_retry_delay = std::chrono::seconds(1))
         : max_consecutive_errors_(max_consecutive_errors)
         , reconnect_retry_delay_(reconnect_retry_delay)
@@ -39,6 +41,8 @@ public:
         }
         consecutive_errors_ = max_consecutive_errors_;
         next_reconnect_at_ = now + reconnect_retry_delay_;
+        // next_guidance_retry_at_ is consumed by GuidanceOpsApp only;
+        // ControlLoop retries guidance on its own background init thread.
         next_guidance_retry_at_ = now + guidance_retry_delay_;
         return true;
     }

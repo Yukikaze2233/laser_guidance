@@ -1,7 +1,5 @@
 #include "config.hpp"
 
-#include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <format>
 #include <stdexcept>
@@ -11,21 +9,16 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include "laser_guidance/support.hpp"
+
 namespace rmcs_laser_guidance {
 namespace {
-
-auto to_lower_copy(std::string value) -> std::string {
-    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
 
 template <typename Enum, std::size_t N>
 auto parse_enum(
     std::string_view value, const std::pair<std::string_view, Enum> (&mapping)[N],
     std::string_view error_message) -> Enum {
-    const std::string lower = to_lower_copy(std::string(value));
+    const std::string lower = to_lower(std::string(value));
     for (const auto& [name, kind] : mapping) {
         if (lower == name)
             return kind;
@@ -111,6 +104,46 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
         read_opt(hik, "software_sync", config.hik.software_sync);
         read_opt(hik, "trigger_mode", config.hik.trigger_mode);
         read_opt(hik, "fixed_framerate", config.hik.fixed_framerate);
+        read_opt(hik, "profile_switch_delay_s", config.hik.profile_switch_delay_s);
+        if (hik["white_balance_ratio_red"] || hik["white_balance_ratio_green"]
+            || hik["white_balance_ratio_blue"]) {
+            config.hik.set_white_balance = true;
+            read_opt(hik, "white_balance_ratio_red", config.hik.white_balance_ratio_red);
+            read_opt(hik, "white_balance_ratio_green", config.hik.white_balance_ratio_green);
+            read_opt(hik, "white_balance_ratio_blue", config.hik.white_balance_ratio_blue);
+        }
+        if (hik["white_balance_auto"]) {
+            if (hik["white_balance_auto"].as<std::string>() == "off")
+                config.hik.white_balance_off = true;
+            else if (hik["white_balance_auto"].as<std::string>() == "continuous")
+                config.hik.white_balance_off = false;
+        }
+
+        if (const YAML::Node unlit = hik["profile_unlit"]) {
+            config.hik.has_unlit_profile = true;
+            config.hik.unlit.exposure_us = config.hik.exposure_us;
+            config.hik.unlit.gain = config.hik.gain;
+            config.hik.unlit.framerate = config.hik.framerate;
+            config.hik.unlit.white_balance_off = config.hik.white_balance_off;
+            read_opt(unlit, "exposure_us", config.hik.unlit.exposure_us);
+            read_opt(unlit, "gain", config.hik.unlit.gain);
+            read_opt(unlit, "framerate", config.hik.unlit.framerate);
+            if (unlit["white_balance_auto"]) {
+                if (unlit["white_balance_auto"].as<std::string>() == "off")
+                    config.hik.unlit.white_balance_off = true;
+                else if (unlit["white_balance_auto"].as<std::string>() == "continuous")
+                    config.hik.unlit.white_balance_off = false;
+            }
+            if (unlit["white_balance_ratio_red"] || unlit["white_balance_ratio_green"]
+                || unlit["white_balance_ratio_blue"]) {
+                config.hik.unlit.set_white_balance = true;
+                read_opt(unlit, "white_balance_ratio_red", config.hik.unlit.white_balance_ratio_red);
+                read_opt(
+                    unlit, "white_balance_ratio_green", config.hik.unlit.white_balance_ratio_green);
+                read_opt(
+                    unlit, "white_balance_ratio_blue", config.hik.unlit.white_balance_ratio_blue);
+            }
+        }
     }
 
     if (const YAML::Node debug = yaml["debug"]) {
@@ -151,11 +184,12 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
         if (inference["model_path"])
             config.inference.model_path = inference["model_path"].as<std::string>();
         if (inference["enemy_color"]) {
-            const auto ec = to_lower_copy(inference["enemy_color"].as<std::string>());
+            const auto ec = to_lower(inference["enemy_color"].as<std::string>());
+            // enemy_color selects the armor class we attack (model ids: 0=red, 1=blue).
             if (ec == "red")
-                config.inference.enemy_class_id = 1;
+                config.inference.enemy_class_id = 0;
             else if (ec == "blue")
-                config.inference.enemy_class_id = 2;
+                config.inference.enemy_class_id = 1;
             else if (ec == "auto")
                 config.inference.enemy_class_id = -1;
             else
@@ -177,6 +211,10 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.rtp.encoder = streaming["encoder"].as<std::string>();
         if (streaming["bitrate"])
             config.rtp.bitrate = streaming["bitrate"].as<std::string>();
+        if (streaming["max_width"])
+            config.rtp.max_width = streaming["max_width"].as<int>();
+        if (streaming["max_fps"])
+            config.rtp.max_fps = streaming["max_fps"].as<int>();
     }
 
     if (const YAML::Node udp_cfg = yaml["udp"]) {
@@ -195,6 +233,17 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.zmq.host = zmq_cfg["host"].as<std::string>();
         if (zmq_cfg["port"])
             config.zmq.port = zmq_cfg["port"].as<int>();
+    }
+
+    if (const YAML::Node referee_cfg = yaml["referee"]) {
+        if (referee_cfg["enabled"])
+            config.referee.enabled = referee_cfg["enabled"].as<bool>();
+        if (referee_cfg["zmq_address"])
+            config.referee.zmq_address = referee_cfg["zmq_address"].as<std::string>();
+        if (referee_cfg["match_duration_s"])
+            config.referee.match_duration_s = referee_cfg["match_duration_s"].as<int>();
+        if (referee_cfg["signal_timeout_s"])
+            config.referee.signal_timeout_s = referee_cfg["signal_timeout_s"].as<int>();
     }
 
     if (const YAML::Node ekf = yaml["ekf"]) {
@@ -256,6 +305,20 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.guidance.voltage_offset_vy = guidance["voltage_offset_vy"].as<float>();
         if (guidance["depth_scale"])
             config.guidance.depth_scale = guidance["depth_scale"].as<float>();
+        if (guidance["depth_filter_enabled"])
+            config.guidance.depth_filter_enabled = guidance["depth_filter_enabled"].as<bool>();
+        if (guidance["depth_process_noise_q"])
+            config.guidance.depth_process_noise_q = guidance["depth_process_noise_q"].as<double>();
+        if (guidance["depth_measurement_noise_r"])
+            config.guidance.depth_measurement_noise_r =
+                guidance["depth_measurement_noise_r"].as<double>();
+        if (guidance["depth_initial_pos_std"])
+            config.guidance.depth_initial_pos_std = guidance["depth_initial_pos_std"].as<double>();
+        if (guidance["depth_initial_vel_std"])
+            config.guidance.depth_initial_vel_std = guidance["depth_initial_vel_std"].as<double>();
+        if (guidance["depth_max_missed_frames"])
+            config.guidance.depth_max_missed_frames =
+                guidance["depth_max_missed_frames"].as<int>();
         if (guidance["voltage_gain_x"])
             config.guidance.voltage_gain_x = guidance["voltage_gain_x"].as<float>();
         if (guidance["voltage_gain_y"])
@@ -264,6 +327,16 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.guidance.angle_offset_x_deg = guidance["angle_offset_x_deg"].as<float>();
         if (guidance["angle_offset_y_deg"])
             config.guidance.angle_offset_y_deg = guidance["angle_offset_y_deg"].as<float>();
+        if (guidance["angle_offset_unlit_x_deg"])
+            config.guidance.angle_offset_unlit_x_deg =
+                guidance["angle_offset_unlit_x_deg"].as<float>();
+        else
+            config.guidance.angle_offset_unlit_x_deg = config.guidance.angle_offset_x_deg;
+        if (guidance["angle_offset_unlit_y_deg"])
+            config.guidance.angle_offset_unlit_y_deg =
+                guidance["angle_offset_unlit_y_deg"].as<float>();
+        else
+            config.guidance.angle_offset_unlit_y_deg = config.guidance.angle_offset_y_deg;
 
         if (const YAML::Node geom_list = guidance["target_geometry"]) {
             config.guidance.target_geometry.clear();
@@ -281,7 +354,7 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
 
         if (const YAML::Node wiring = guidance["wiring"]) {
             if (wiring["mode"]) {
-                const auto mode_str = to_lower_copy(wiring["mode"].as<std::string>());
+                const auto mode_str = to_lower(wiring["mode"].as<std::string>());
                 if (mode_str == "differential")
                     config.guidance.wiring.mode = GalvoWiringMode::differential;
                 else if (mode_str == "single_ended")
@@ -298,9 +371,11 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
         }
 
         if (guidance["scan_mode"]) {
-            const auto mode = to_lower_copy(guidance["scan_mode"].as<std::string>());
+            const auto mode = to_lower(guidance["scan_mode"].as<std::string>());
             if (mode == "rectangle")
                 config.guidance.scan_mode = ScanMode::rectangle;
+            else if (mode == "sine")
+                config.guidance.scan_mode = ScanMode::sine;
         }
         if (guidance["scan_width_deg"])
             config.guidance.scan_width_deg = guidance["scan_width_deg"].as<float>();
@@ -308,6 +383,13 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
             config.guidance.scan_height_deg = guidance["scan_height_deg"].as<float>();
         if (guidance["scan_grid_n"])
             config.guidance.scan_grid_n = guidance["scan_grid_n"].as<int>();
+        if (guidance["scan_max_velocity_deg_s"])
+            config.guidance.scan_max_velocity_deg_s =
+                guidance["scan_max_velocity_deg_s"].as<float>();
+        if (guidance["scan_accel_deg_s2"])
+            config.guidance.scan_accel_deg_s2 = guidance["scan_accel_deg_s2"].as<float>();
+        if (guidance["scan_sine_cycles"])
+            config.guidance.scan_sine_cycles = guidance["scan_sine_cycles"].as<int>();
         if (guidance["calib_mode"])
             config.guidance.calib_mode = guidance["calib_mode"].as<bool>();
         if (guidance["calib_angle_x_deg"])
@@ -324,6 +406,20 @@ auto load_config(const std::filesystem::path& config_path) -> Config {
         throw std::runtime_error("v4l2.height must be positive");
     if (config.v4l2.framerate <= 0.0F)
         throw std::runtime_error("v4l2.framerate must be positive");
+    if (config.hik.exposure_us <= 0.0F)
+        throw std::runtime_error("hik.exposure_us must be positive");
+    if (config.hik.gain < 0.0F)
+        throw std::runtime_error("hik.gain must be non-negative");
+    if (config.hik.framerate <= 0.0F)
+        throw std::runtime_error("hik.framerate must be positive");
+    if (config.hik.has_unlit_profile) {
+        if (config.hik.unlit.exposure_us <= 0.0F)
+            throw std::runtime_error("hik.profile_unlit.exposure_us must be positive");
+        if (config.hik.unlit.gain < 0.0F)
+            throw std::runtime_error("hik.profile_unlit.gain must be non-negative");
+        if (config.hik.unlit.framerate <= 0.0F)
+            throw std::runtime_error("hik.profile_unlit.framerate must be positive");
+    }
     if (config.runtime.max_input_age_ms <= 0)
         throw std::runtime_error("runtime.max_input_age_ms must be positive");
     if (config.runtime.max_observation_age_ms <= 0)

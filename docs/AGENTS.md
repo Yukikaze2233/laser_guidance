@@ -20,6 +20,7 @@
 - FT4222H USB-to-SPI 振镜控制
 - Direct voltage 视觉到电压映射
 - `HitProgress`、EKF 跟踪、敌方颜色过滤
+- `RefereeLink` 订阅裁判系统 ZMQ（0x0001/0x020C），全程引导；比赛窗口以裁判 `stage_remain_time` 为权威（技术暂停时停表），断流超过 `signal_timeout_s` 才退化本地 `match_duration_s` 兜底；game_progress 用于每局 HitProgress 重置与 0x020C 锁定校核，无信号/赛外退化纯本地计算；`tools/referee_sim` 提供本地 mock；比赛窗口内以官方反制成功次数（0x020C 边沿计数）权威同步阶段，离线退回本地。
 
 当前明确不包含：
 
@@ -31,11 +32,13 @@
 
 - ROS2 bridge 为强制编译依赖（Docker 内置），`RosBridge` 构造时自行调用 `rclcpp::init()` 若尚未初始化。
 - FT4222 `libft4222.so` 由 `src/io/ft4222_spi.cpp` 通过 `dlopen` 动态加载，缺库或缺板卡时只影响 guidance，不阻塞主流程。
+- MVS SDK U3V 控制传输不 claim 接口会触发内核 reset（dmesg `did not claim interface`）；`src/io/libusb_claim_shim.cpp` 为 LD_PRELOAD 拦截层（`build/liblibusb_claim_shim.so`），由 `.script/host-runtime-env.sh` 注入 daemon 进程自动补 claim，缺失时不影响主流程。
 - `tools/dac8568_smoke` / `tools/galvo_smoke` 保留硬失败语义。
 - 推理后端初始化遵循"先首选择后降级"策略，不再同时无条件构造 ONNX 和 TensorRT。
 - `PerceptionRunner::degraded()` 反映后端实际可用性。
 - `HitProgress` 按 RoboMaster 2026 空中机器人反制规则计算 5 次锁定与 1/2/3 难度阶段。
 - 推流 encoder 在无 CUDA 设备时自动从 `h264_nvenc` 回退到 `libx264`。
+- 旋转外参标定由工具级 `laser_guidance_calibration` 承担：固定机械平移与镜距，只接受七列有深度记录，并通过 Ceres `QuaternionManifold` 优化 `R_GC`；Wahba 只用于诊断或备用初值。
 - 运行时日志写入 `logs/<timestamp>/laser_daemon.log`（stream）和 `logs/<timestamp>/laser_competition.log`（competition）。
 
 ## 目录职责
@@ -49,7 +52,7 @@
 - `src/vision/`
   - 视觉与推理：`ModelInfer`、`ModelRuntime`、`ModelAdapter`、`TensorRTEngine`、`TrainingData`。
 - `src/guidance/`
-  - 引导模块：`AimSolver`、`GalvoExecutor`、`ScanController`、`VoltageMapper`、`GalvoDriver`、`CameraProjection`。
+  - 引导模块：`AimSolver`、`GalvoExecutor`、`ScanController`、`VoltageMapper`、`GalvoDriver`、`CameraProjection`、`MotionPlanner`、`scan_path`。
 - `src/runtime/`
   - runtime 核心：`ControlLoop`、`PerceptionRunner`、`GuidanceSession`、`RuntimeOutputs`、`OverlayRenderer`、`GuidanceOpsApp`。
 - `src/bridges/`

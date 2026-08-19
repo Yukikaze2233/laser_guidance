@@ -1,46 +1,25 @@
 #include "laser_guidance/runtime.hpp"
 
-namespace rmcs_laser_guidance {
+namespace rmcs_laser_guidance::runtime_command {
 
-auto RuntimeCommand::set_streaming(const bool enabled) -> RuntimeCommand {
-    return RuntimeCommand{
-        .type = RuntimeCommandType::set_streaming,
-        .enabled = enabled,
-    };
+auto set_streaming(const bool enabled) -> RuntimeCommand {
+    return CmdSetStreaming{.enabled = enabled};
 }
-
-auto RuntimeCommand::set_recording(const bool enabled) -> RuntimeCommand {
-    return RuntimeCommand{
-        .type = RuntimeCommandType::set_recording,
-        .enabled = enabled,
-    };
+auto set_recording(const bool enabled) -> RuntimeCommand {
+    return CmdSetRecording{.enabled = enabled};
 }
-
-auto RuntimeCommand::set_enemy_color(const EnemyColor color) -> RuntimeCommand {
-    return RuntimeCommand{
-        .type = RuntimeCommandType::set_enemy_color,
-        .enemy_color = color,
-    };
+auto set_enemy_color(const EnemyColor color) -> RuntimeCommand {
+    return CmdSetEnemyColor{.enemy_color = color};
 }
-
-auto RuntimeCommand::set_backend(const RuntimeBackend backend) -> RuntimeCommand {
-    return RuntimeCommand{
-        .type = RuntimeCommandType::set_backend,
-        .backend = backend,
-    };
+auto set_backend(const RuntimeBackend backend) -> RuntimeCommand {
+    return CmdSetBackend{.backend = backend};
 }
-
-auto RuntimeCommand::set_ekf(const bool enabled) -> RuntimeCommand {
-    return RuntimeCommand{
-        .type = RuntimeCommandType::set_ekf,
-        .enabled = enabled,
-    };
+auto set_ekf(const bool enabled) -> RuntimeCommand {
+    return CmdSetEkf{.enabled = enabled};
 }
-
-auto RuntimeCommand::shutdown() -> RuntimeCommand {
-    return RuntimeCommand{
-        .type = RuntimeCommandType::shutdown,
-    };
+auto set_offset(const float x_deg, const float y_deg) -> RuntimeCommand {
+    return CmdSetOffset{.x_deg = x_deg, .y_deg = y_deg};
 }
+auto shutdown() -> RuntimeCommand { return CmdShutdown{}; }
 
-} // namespace rmcs_laser_guidance
+} // namespace rmcs_laser_guidance::runtime_command

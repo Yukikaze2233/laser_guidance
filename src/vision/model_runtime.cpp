@@ -58,19 +58,24 @@ auto extract_value_info(
     return values;
 }
 
-auto input_dimensions(const ModelValueInfo& input, const cv::Mat& image) -> std::pair<int, int> {
+auto input_dimensions(const ModelValueInfo& input, const cv::Mat& /*image*/) -> std::pair<int, int> {
     if (input.shape.size() != 4)
         throw std::runtime_error("model input must be a 4D tensor");
     if (input.shape[1] != 3)
         throw std::runtime_error("model input must use NCHW with 3 channels");
 
     constexpr int kYoloStride = 32;
+    constexpr int kDefaultDynamicSize = 1216;
+    static_assert(kDefaultDynamicSize % kYoloStride == 0, "default dynamic size must be a multiple of YOLO stride");
     const int input_height =
         input.shape[2] > 0 ? static_cast<int>(input.shape[2])
-                           : ((image.rows + kYoloStride - 1) / kYoloStride * kYoloStride);
+                           : kDefaultDynamicSize;
     const int input_width =
         input.shape[3] > 0 ? static_cast<int>(input.shape[3])
-                           : ((image.cols + kYoloStride - 1) / kYoloStride * kYoloStride);
+                           : kDefaultDynamicSize;
+    if (input_height % kYoloStride != 0 || input_width % kYoloStride != 0)
+        throw std::runtime_error(
+            "model input dimensions must be multiples of " + std::to_string(kYoloStride));
     if (input_height <= 0 || input_width <= 0)
         throw std::runtime_error("model input height/width must resolve to positive values");
 
@@ -86,78 +91,14 @@ struct PreparedInput {
     ModelImageTransform transform{};
 };
 
-auto ensure_bgr_image(const cv::Mat& image) -> cv::Mat {
-    if (image.empty())
-        throw std::runtime_error("model runtime received an empty image");
-
-    if (image.channels() == 3)
-        return image;
-
-    cv::Mat converted;
-    if (image.channels() == 1) {
-        cv::cvtColor(image, converted, cv::COLOR_GRAY2BGR);
-        return converted;
-    }
-    if (image.channels() == 4) {
-        cv::cvtColor(image, converted, cv::COLOR_BGRA2BGR);
-        return converted;
-    }
-
-    throw std::runtime_error("model runtime received an unsupported image channel count");
-}
-
 auto prepare_input_tensor(const cv::Mat& image, const ModelValueInfo& input) -> PreparedInput {
-    const cv::Mat bgr = ensure_bgr_image(image);
-    const auto [input_height, input_width] = input_dimensions(input, bgr);
-
-    const float scale_x = static_cast<float>(input_width) / static_cast<float>(bgr.cols);
-    const float scale_y = static_cast<float>(input_height) / static_cast<float>(bgr.rows);
-    const float scale = std::min(scale_x, scale_y);
-    const int resized_width = std::max(1, static_cast<int>(std::lround(bgr.cols * scale)));
-    const int resized_height = std::max(1, static_cast<int>(std::lround(bgr.rows * scale)));
-    const int pad_x = (input_width - resized_width) / 2;
-    const int pad_y = (input_height - resized_height) / 2;
-
-    cv::Mat resized;
-    cv::resize(bgr, resized, cv::Size(resized_width, resized_height), 0.0, 0.0, cv::INTER_LINEAR);
-
-    cv::Mat letterboxed(input_height, input_width, CV_8UC3, cv::Scalar(114, 114, 114));
-    resized.copyTo(letterboxed(cv::Rect(pad_x, pad_y, resized_width, resized_height)));
-
-    cv::Mat rgb;
-    cv::cvtColor(letterboxed, rgb, cv::COLOR_BGR2RGB);
-    cv::Mat rgb_float;
-    rgb.convertTo(rgb_float, CV_32F, 1.0 / 255.0);
-
-    std::vector<cv::Mat> channels;
-    cv::split(rgb_float, channels);
-    if (channels.size() != 3)
-        throw std::runtime_error("failed to split model input into RGB channels");
-
-    PreparedInput prepared{
-        .values = std::vector<float>(
-            3ULL * static_cast<std::size_t>(input_height) * static_cast<std::size_t>(input_width)),
+    const auto [input_height, input_width] = input_dimensions(input, image);
+    auto [data, transform] = preprocess_blob(image, input_width, input_height);
+    return PreparedInput{
+        .values = std::move(data),
         .shape = {1, 3, input_height, input_width},
-        .transform =
-            ModelImageTransform{
-                .original_width = bgr.cols,
-                .original_height = bgr.rows,
-                .input_width = input_width,
-                .input_height = input_height,
-                .scale = scale,
-                .pad_x = static_cast<float>(pad_x),
-                .pad_y = static_cast<float>(pad_y),
-            },
+        .transform = transform,
     };
-
-    const std::size_t channel_size =
-        static_cast<std::size_t>(input_height) * static_cast<std::size_t>(input_width);
-    for (std::size_t index = 0; index < channels.size(); ++index) {
-        const auto* begin = channels[index].ptr<float>(0);
-        std::copy(begin, begin + channel_size, prepared.values.begin() + index * channel_size);
-    }
-
-    return prepared;
 }
 
 auto extract_tensor_data(const ModelValueInfo& metadata, const Ort::Value& value)
@@ -211,6 +152,59 @@ auto extract_tensor_data(const ModelValueInfo& metadata, const Ort::Value& value
 }
 
 } // namespace
+
+auto preprocess_blob(const cv::Mat& image, int input_w, int input_h)
+    -> std::pair<std::vector<float>, ModelImageTransform> {
+    const float scale_x = static_cast<float>(input_w) / static_cast<float>(image.cols);
+    const float scale_y = static_cast<float>(input_h) / static_cast<float>(image.rows);
+    const float scale = std::min(scale_x, scale_y);
+    const int resized_width = std::max(1, static_cast<int>(std::lround(image.cols * scale)));
+    const int resized_height = std::max(1, static_cast<int>(std::lround(image.rows * scale)));
+    const int pad_left = (input_w - resized_width) / 2;
+    const int pad_top = (input_h - resized_height) / 2;
+    const float pad_x = static_cast<float>(pad_left);
+    const float pad_y = static_cast<float>(pad_top);
+
+    // Normal path: capture already delivers BGR8. Mono is defensive only (e.g. gray V4L2).
+    cv::Mat bgr;
+    if (image.channels() == 1) {
+        cv::cvtColor(image, bgr, cv::COLOR_GRAY2BGR);
+    } else {
+        bgr = image;
+    }
+
+    cv::Mat resized;
+    cv::resize(bgr, resized, cv::Size(resized_width, resized_height), 0.0, 0.0, cv::INTER_LINEAR);
+
+    cv::Mat padded(input_h, input_w, CV_8UC3, cv::Scalar(114, 114, 114));
+    resized.copyTo(padded(cv::Rect(pad_left, pad_top, resized_width, resized_height)));
+
+    padded.convertTo(padded, CV_32FC3, 1.0 / 255.0);
+
+    std::vector<float> data(3 * input_w * input_h);
+    for (int c = 0; c < 3; ++c) {
+        const int src_channel = 2 - c; // BGR→RGB swap during packing
+        for (int y = 0; y < input_h; ++y) {
+            const float* row = padded.ptr<float>(y);
+            for (int x = 0; x < input_w; ++x) {
+                data[c * input_w * input_h + y * input_w + x] = row[x * 3 + src_channel];
+            }
+        }
+    }
+
+    return {
+        std::move(data),
+        ModelImageTransform{
+            .original_width = image.cols,
+            .original_height = image.rows,
+            .input_width = input_w,
+            .input_height = input_h,
+            .scale = scale,
+            .pad_x = pad_x,
+            .pad_y = pad_y,
+        },
+    };
+}
 
 struct ModelRuntime::Details {
     Details()

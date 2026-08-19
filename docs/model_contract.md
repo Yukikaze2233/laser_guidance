@@ -1,53 +1,50 @@
 # Model Contract: Target Detection
 
-> Version: 1.0-draft
-> Status: awaiting-onnx-export
-> Last updated: 2026-06-08
+> Version: 1.1
+> Status: active (`models/exp-2.onnx` / `models/exp-2.engine`)
+> Last updated: 2026-07-29
 
 ## Purpose
 
-This document defines the frozen model contract for the first deployable target-detection model used by `rmcs_laser_guidance`. It is the source of truth for ONNX export, TensorRT engine generation, and C++ runtime integration.
+This document defines the model contract for the deployable target-detection model used by `rmcs_laser_guidance`. It is the source of truth for ONNX export, TensorRT engine generation, and C++ runtime integration.
 
 ## Input
 
 | Field     | Value                    | Notes                                 |
 |-----------|--------------------------|---------------------------------------|
-| Name      | `images`                 | Must confirm after ONNX export        |
-| Shape     | `1x3x640x640`            | Fixed shape, Batch=1                  |
+| Name      | `images`                 | Ultralytics YOLO export               |
+| Shape     | `1x3x1280x1280`          | Current `exp-2` imgsz; Batch=1        |
 | Layout    | `NCHW`                   | Channels first                        |
 | Dtype     | `FP32` input             | TensorRT runtime may use FP16 kernels |
-| Color     | `[DECISION NEEDED: RGB or BGR — confirm after export]` | |
-| Normalization | `[DECISION NEEDED: 0~1 range or mean/std — confirm after export]` | |
-| Dynamic shape | Not supported in v1 | Fixed shape only                 |
+| Color     | RGB                      | Ultralytics default                   |
+| Normalization | `0~1`                | Divide by 255                         |
+| Dynamic shape | Export may be dynamic; runtime uses fixed batch-1 letterbox | |
 
 ## Output
 
 | Field         | Value                                | Notes |
 |---------------|--------------------------------------|-------|
-| Class count   | 3 | `0=Purple`, `1=Red`, `2=Blue` |
-| Class names   | `Red`, `Blue`, `Purple` | |
-| NMS location  | `[DECISION NEEDED: inside model or C++ postprocess — confirm after export]` | |
-| Bbox format   | `[DECISION NEEDED: xyxy / cxcywh / other — confirm after export]` | |
-| Output tensors | `[DECISION NEEDED: exact YOLO output tensor contract after export]` | Tensor names, shapes, and semantics must be confirmed after `.onnx` export |
+| Class count   | 4 | From ONNX metadata `names` |
+| Class ids     | `0=Red(红色)`, `1=Blue(蓝色)`, `2=Purple(紫色)`, `3=Colorless(无色)` | Canonical runtime mapping |
+| Class names   | `Red`, `Blue`, `Purple`, `Colorless` | English aliases used in code/docs |
+| NMS location  | C++ postprocess (`ModelAdapter`) when export has `nms=False` | |
+| Bbox format   | Model input space, then unletterboxed to original frame pixels | |
 | Confidence    | Float                                | |
 
-> **Important**: Single model with 3 classes shares a common backbone. Purple is a model class (id=0), not a separate model. Runtime filters by `match_color` config: red team accepts Blue+Purple, rejects Red; blue team accepts Red+Purple, rejects Blue.
+> **Important**: Single model with 4 classes. Purple is class id **2** (HIT), and Colorless is class id **3**. The runtime preserves all four classes for continuous guidance. In competition mode, Purple and Colorless are additionally consumed by the countermeasure state machine; they are not rejected from guidance.
 
-## Runtime Color Filter
+## Runtime Guidance Classes
 
 ```text
-config: match_color = red | blue
-
-match_color=red:
-  class=Blue  → accept (target)
-  class=Red   → reject (own team)
-  class=Purple → accept (HIT, both teams)
-
-match_color=blue:
-  class=Red   → accept (target)
-  class=Blue  → reject (own team)
-  class=Purple → accept (HIT, both teams)
+class=Red(0)       → retain for guidance
+class=Blue(1)      → retain for guidance
+class=Purple(2)    → retain for guidance and countermeasure progress
+class=Colorless(3) → retain for guidance and countermeasure confirmation/progress
 ```
+
+`enemy_color` remains available as a runtime control value, but it does not
+remove model detections from the physical guidance path. Target selection and
+countermeasure state consume the same retained detection batch.
 
 ## Runtime Artifact
 
@@ -90,17 +87,20 @@ Before a model is accepted for runtime deployment:
 
 ## Hit Detection (model class + temporal hysteresis)
 
-Purple is a model output class (id=0). HIT state uses temporal hysteresis on consecutive Purple detections:
+Purple is a model output class (**id=2**). HIT state uses temporal hysteresis on consecutive Purple detections:
 
-- Purple class triggers candidate HIT state.
-- **Hysteresis defaults**:
-  - `purple_ratio_on = 0.18`
-  - `purple_ratio_off = 0.10`
-  - `confirm_frames = 3`
-  - `release_frames = 5`
-- HIT confirms after N consecutive frames above the on-threshold.
-- HIT releases after M consecutive frames below the off-threshold.
-- Flicker between thresholds does not toggle HIT rapidly.
+- Purple (`class_id == 2`) triggers candidate HIT state.
+- Colorless (`class_id == 3`) does not add Purple progress. During the first
+  three countermeasure stages it confirms a countermeasure only after the
+  Purple `HitProgress` threshold is reached; during difficulty-3 stages it is
+  the continuing illumination class used for progress.
+- **Hysteresis defaults** (`HitStateMachine` / runtime config):
+  - `hit_confirm_frames = 3`
+  - `hit_release_frames = 5`
+  - score gate typically `>= 0.25`
+- HIT confirms after N consecutive Purple frames.
+- HIT releases after M consecutive non-Purple frames.
+- Flicker does not toggle HIT rapidly.
 
 ## Versioning
 
@@ -126,7 +126,7 @@ Each model artifact should carry:
 - INT8, CUDA Graph runtime, CPU affinity tuning.
 - Automatic GPU/CPU backend switching.
 - Local model training.
-- Separate ROI color classifier for Red/Blue/Purple target identification in v1 (the model already predicts `Red`, `Blue`, `Purple`; runtime only applies `match_color` filtering and Purple HIT hysteresis).
+- Separate ROI color classifier (the model already predicts `Red`, `Blue`, `Purple`, `Colorless`; runtime passes all model classes to guidance and uses Purple/Colorless for countermeasure state).
 
 ## References
 

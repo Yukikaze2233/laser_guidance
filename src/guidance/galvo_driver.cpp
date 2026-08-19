@@ -43,10 +43,11 @@ GalvoDriver::GalvoDriver(Ft4222Spi& spi, const GuidanceConfig& config)
     : spi_(spi)
     , config_(config) {}
 
-auto GalvoDriver::enable_reference() -> std::expected<void, std::string> {
+auto GalvoDriver::enable_reference() -> std::expected<void, Error> {
     constexpr std::uint32_t kEnableInternalRef = 0x08000001u;
     const auto bytes = payload_bytes(kEnableInternalRef);
     std::println("galvo: enabling DAC internal reference");
+    std::scoped_lock lock(io_mutex_);
     auto result = spi_.write(bytes.data(), 4);
     if (result)
         reference_enabled_ = true;
@@ -57,7 +58,7 @@ auto GalvoDriver::negotiated_clock_hz() const noexcept -> std::uint32_t {
     return spi_.negotiated_clock_hz();
 }
 
-auto GalvoDriver::set_center() -> std::expected<void, std::string> {
+auto GalvoDriver::set_center() -> std::expected<void, Error> {
     return set_angles(0.0F, 0.0F);
 }
 
@@ -67,7 +68,7 @@ auto GalvoDriver::optical_to_voltage(float angle_deg) const -> float {
 }
 
 auto GalvoDriver::write_voltage(std::uint8_t channel, float voltage, const char*)
-    -> std::expected<void, std::string> {
+    -> std::expected<void, Error> {
 
     const double clipped = clamp_voltage(static_cast<double>(voltage));
     const auto code = voltage_to_code(clipped);
@@ -77,10 +78,11 @@ auto GalvoDriver::write_voltage(std::uint8_t channel, float voltage, const char*
 }
 
 auto GalvoDriver::set_angles(float optical_x_deg, float optical_y_deg)
-    -> std::expected<void, std::string> {
+    -> std::expected<void, Error> {
 
     if (!reference_enabled_) {
-        return std::unexpected("DAC internal reference not enabled");
+        return std::unexpected(
+            make_error(ErrorKind::unavailable, "DAC internal reference not enabled"));
     }
 
     const float vx = optical_to_voltage(optical_x_deg);
@@ -90,11 +92,16 @@ auto GalvoDriver::set_angles(float optical_x_deg, float optical_y_deg)
 }
 
 auto GalvoDriver::set_voltages(float x_voltage, float y_voltage)
-    -> std::expected<void, std::string> {
+    -> std::expected<void, Error> {
 
     if (!reference_enabled_) {
-        return std::unexpected("DAC internal reference not enabled");
+        return std::unexpected(
+            make_error(ErrorKind::unavailable, "DAC internal reference not enabled"));
     }
+
+    // One lock around the whole 2/4-channel transaction: interleaving a scan
+    // write between channels would leave the DAC in a mixed state.
+    std::scoped_lock lock(io_mutex_);
 
     const auto& w = config_.wiring;
     const bool diff = w.mode == GalvoWiringMode::differential;
@@ -120,6 +127,11 @@ auto GalvoDriver::set_voltages(float x_voltage, float y_voltage)
             !r)
             return r;
     }
+    std::println(
+        stderr,
+        "[SETV-DIAG] x={:+.4f}V(chan{}:+{:+.4f},chan{}:{:+.4f}) y={:+.4f}V(chan{}:+{:+.4f},chan{}:{:+.4f})",
+        x_voltage, w.x_plus_channel, x_pos_v, w.x_minus_channel, x_neg_v, y_voltage,
+        w.y_plus_channel, y_pos_v, w.y_minus_channel, y_neg_v);
     return {};
 }
 

@@ -1,20 +1,24 @@
 #include "guidance/scan_controller.hpp"
 
-#include <algorithm>
+#include <chrono>
 #include <print>
+#include <thread>
 
 #include "guidance/galvo_driver.hpp"
 #include "guidance/galvo_executor.hpp"
+#include "laser_guidance/error.hpp"
 
 namespace rmcs_laser_guidance {
 
 ScanController::ScanController(const GuidanceConfig& config, GalvoExecutor& executor)
     : config_(config)
     , executor_(executor)
-    , enabled_(config.scan_mode == ScanMode::rectangle && executor.is_initialized())
+    , enabled_(
+          (config.scan_mode == ScanMode::rectangle || config.scan_mode == ScanMode::sine)
+          && executor.is_initialized())
     , voltage_mode_(config.command_model == GuidanceCommandModelKind::direct_voltage) {
     if (enabled_) {
-        worker_ = std::thread([this] { run(); });
+        worker_ = std::jthread([this] { run(); });
     }
 }
 
@@ -55,107 +59,101 @@ auto ScanController::stop() -> void {
         stop_requested_ = true;
         active_ = false;
     }
+    worker_.request_stop();
     cv_.notify_all();
-    if (worker_.joinable()) {
-        worker_.join();
-    }
 }
 
-auto ScanController::scan_rectangle_once(const float cx_deg, const float cy_deg) -> std::string {
+auto ScanController::run_pass(const std::vector<std::pair<float, float>>& path) -> std::string {
+    if (path.empty()) {
+        return {};
+    }
     auto* driver = executor_.driver();
     if (driver == nullptr) {
         return "scan driver unavailable";
     }
-    const float hw = config_.scan_width_deg * 0.5F;
-    const float hh = config_.scan_height_deg * 0.5F;
-    const int n = std::max(2, config_.scan_grid_n);
-    const float sx = config_.scan_width_deg / static_cast<float>(n - 1);
-    const float sy = config_.scan_height_deg / static_cast<float>(n - 1);
+    if (!(config_.scan_max_velocity_deg_s > 0.0F) || !(config_.scan_accel_deg_s2 > 0.0F)) {
+        std::println(
+            stderr,
+            "guidance: invalid scan motion params (v={} a={}), jumping to path start",
+            config_.scan_max_velocity_deg_s, config_.scan_accel_deg_s2);
+        auto r = voltage_mode_ ? driver->set_voltages(path.front().first, path.front().second)
+                               : driver->set_angles(path.front().first, path.front().second);
+        return r ? std::string{} : format_error(r.error());
+    }
 
-    for (int row = 0; row < n; ++row) {
+    MotionPlanner planner(
+        config_.scan_max_velocity_deg_s, config_.scan_accel_deg_s2, 0.001F);
+    planner.set_origin(path.front().first, path.front().second);
+    for (std::size_t i = 1; i < path.size(); ++i) {
+        planner.move_to(path[i].first, path[i].second);
+    }
+
+    while (!planner.done()) {
         {
             std::scoped_lock lock(mutex_);
             if (stop_requested_ || !active_) {
                 return {};
             }
         }
-        const float y = cy_deg - hh + static_cast<float>(row) * sy;
-        for (int step = 0; step < n; ++step) {
-            {
-                std::scoped_lock lock(mutex_);
-                if (stop_requested_ || !active_) {
-                    return {};
-                }
-            }
-            const int col = row % 2 == 0 ? step : (n - 1 - step);
-            const float x = cx_deg - hw + static_cast<float>(col) * sx;
-            if (auto result = driver->set_angles(x, y); !result) {
-                return "scan write failed: " + result.error();
-            }
+        const auto pt = planner.tick(0.001F);
+        if (!pt) {
+            break;
         }
-    }
-
-    return {};
-}
-
-auto ScanController::scan_rectangle_once_voltage(const float cx_v, const float cy_v) -> std::string {
-    auto* driver = executor_.driver();
-    if (driver == nullptr) {
-        return "scan driver unavailable";
-    }
-    const float hw = driver->optical_to_voltage(config_.scan_width_deg * 0.5F);
-    const float hh = driver->optical_to_voltage(config_.scan_height_deg * 0.5F);
-    const int n = std::max(2, config_.scan_grid_n);
-    const float sx = (hw * 2.0F) / static_cast<float>(n - 1);
-    const float sy = (hh * 2.0F) / static_cast<float>(n - 1);
-
-    for (int row = 0; row < n; ++row) {
-        {
-            std::scoped_lock lock(mutex_);
-            if (stop_requested_ || !active_) {
-                return {};
-            }
+        auto result = voltage_mode_ ? driver->set_voltages(pt->first, pt->second)
+                                    : driver->set_angles(pt->first, pt->second);
+        if (!result) {
+            return "scan write failed: " + format_error(result.error());
         }
-        const float y = cy_v - hh + static_cast<float>(row) * sy;
-        for (int step = 0; step < n; ++step) {
-            {
-                std::scoped_lock lock(mutex_);
-                if (stop_requested_ || !active_) {
-                    return {};
-                }
-            }
-            const int col = row % 2 == 0 ? step : (n - 1 - step);
-            const float x = cx_v - hw + static_cast<float>(col) * sx;
-            if (auto result = driver->set_voltages(x, y); !result) {
-                return "scan voltage write failed: " + result.error();
-            }
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-
     return {};
 }
 
 auto ScanController::run() -> void {
-    while (true) {
+    auto stoken = worker_.get_stop_token();
+    while (!stoken.stop_requested()) {
         std::optional<cv::Point2f> angle_center;
         std::optional<cv::Point2f> voltage_center;
         {
             std::unique_lock lock(mutex_);
-            cv_.wait(lock, [this] { return stop_requested_ || active_; });
-            if (stop_requested_) {
+            cv_.wait(lock, [this, &stoken] {
+                return stoken.stop_requested() || stop_requested_ || active_;
+            });
+            if (stoken.stop_requested()) {
                 return;
             }
             angle_center = angle_center_;
             voltage_center = voltage_center_;
         }
 
-        std::string error;
+        const bool sine = config_.scan_mode == ScanMode::sine;
+        std::vector<std::pair<float, float>> path;
         if (voltage_mode_ && voltage_center.has_value()) {
-            error = scan_rectangle_once_voltage(voltage_center->x, voltage_center->y);
+            auto* driver = executor_.driver();
+            if (driver == nullptr) {
+                continue;
+            }
+            const float wv = driver->optical_to_voltage(config_.scan_width_deg);
+            const float hv = driver->optical_to_voltage(config_.scan_height_deg);
+            path = sine
+                ? make_sine_path(
+                      voltage_center->x, voltage_center->y, wv, hv, config_.scan_sine_cycles, 128)
+                : make_rectangle_snake_path(
+                      voltage_center->x, voltage_center->y, wv, hv, config_.scan_grid_n);
         } else if (!voltage_mode_ && angle_center.has_value()) {
-            error = scan_rectangle_once(angle_center->x, angle_center->y);
+            path = sine
+                ? make_sine_path(
+                      angle_center->x, angle_center->y, config_.scan_width_deg,
+                      config_.scan_height_deg, config_.scan_sine_cycles, 128)
+                : make_rectangle_snake_path(
+                      angle_center->x, angle_center->y, config_.scan_width_deg,
+                      config_.scan_height_deg, config_.scan_grid_n);
         }
 
+        if (path.empty()) {
+            continue;
+        }
+        const std::string error = run_pass(path);
         if (!error.empty()) {
             std::println(stderr, "guidance: {}", error);
         }

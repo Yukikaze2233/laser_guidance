@@ -4,20 +4,23 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "core/frame_format.hpp"
 #include "vision/model_runtime.hpp"
+#include "vision/model_threshold.hpp"
 
 namespace rmcs_laser_guidance {
 namespace {
 
-constexpr float kConfidenceThreshold = 0.25F;
 constexpr float kNmsIouThreshold = 0.45F;
 constexpr float kMaxAspectRatio = 1.5F;
 
@@ -28,24 +31,21 @@ struct DecodedDetection {
 };
 
 auto format_tensor_metadata(const ModelTensorData& tensor) -> std::string {
-    std::string metadata = "name=" + tensor.name + " shape=[";
-    for (std::size_t index = 0; index < tensor.shape.size(); ++index) {
-        if (index != 0)
-            metadata += ", ";
-        metadata += std::to_string(tensor.shape[index]);
+    std::string shape_str;
+    for (std::size_t i = 0; i < tensor.shape.size(); ++i) {
+        if (i)
+            shape_str += ", ";
+        shape_str += std::to_string(tensor.shape[i]);
     }
-    metadata += "] dtype=" + tensor.element_type;
-    return metadata;
+    return std::format("name={} shape=[{}] dtype={}", tensor.name, shape_str, tensor.element_type);
 }
 
 auto tensor_shape_element_count(const std::vector<std::int64_t>& shape) -> std::size_t {
-    std::size_t count = 1;
     for (const auto dim : shape) {
         if (dim <= 0)
             throw std::runtime_error("tensor shape contains non-positive dimension");
-        count *= static_cast<std::size_t>(dim);
     }
-    return count;
+    return std::accumulate(shape.begin(), shape.end(), std::size_t{1}, std::multiplies<>{});
 }
 
 auto clip_box_to_frame(const cv::Rect2f& bbox, const Frame& frame) -> std::optional<cv::Rect2f> {
@@ -77,39 +77,21 @@ auto unletterbox_box(
     return clip_box_to_frame(cv::Rect2f{x1, y1, x2 - x1, y2 - y1}, frame);
 }
 
-auto iou(const cv::Rect2f& lhs, const cv::Rect2f& rhs) -> float {
-    const float x1 = std::max(lhs.x, rhs.x);
-    const float y1 = std::max(lhs.y, rhs.y);
-    const float x2 = std::min(lhs.x + lhs.width, rhs.x + rhs.width);
-    const float y2 = std::min(lhs.y + lhs.height, rhs.y + rhs.height);
-    if (x2 <= x1 || y2 <= y1)
-        return 0.0F;
-
-    const float intersection = (x2 - x1) * (y2 - y1);
-    const float union_area = lhs.area() + rhs.area() - intersection;
-    if (union_area <= 0.0F)
-        return 0.0F;
-    return intersection / union_area;
-}
-
 auto apply_nms(std::vector<DecodedDetection> detections) -> std::vector<DecodedDetection> {
-    std::sort(detections.begin(), detections.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.score > rhs.score;
-    });
-
-    std::vector<DecodedDetection> kept;
-    kept.reserve(detections.size());
-    for (const auto& candidate : detections) {
-        bool suppressed = false;
-        for (const auto& accepted : kept) {
-            if (iou(candidate.bbox, accepted.bbox) > kNmsIouThreshold) {
-                suppressed = true;
-                break;
-            }
-        }
-        if (!suppressed)
-            kept.push_back(candidate);
+    std::vector<cv::Rect2d> bboxes;
+    bboxes.reserve(detections.size());
+    std::vector<float> scores;
+    scores.reserve(detections.size());
+    for (const auto& d : detections) {
+        bboxes.emplace_back(d.bbox.x, d.bbox.y, d.bbox.width, d.bbox.height);
+        scores.push_back(d.score);
     }
+    std::vector<int> indices;
+    cv::dnn::NMSBoxes(bboxes, scores, kConfidenceThreshold, kNmsIouThreshold, indices);
+    std::vector<DecodedDetection> kept;
+    kept.reserve(indices.size());
+    for (int idx : indices)
+        kept.push_back(std::move(detections[idx]));
     return kept;
 }
 
@@ -278,7 +260,7 @@ auto decode_raw_output(
             score = score * (*best_class);
             class_id = static_cast<std::int32_t>(std::distance(class_begin, best_class));
         }
-        if (score < kConfidenceThreshold)
+        if (score < confidence_threshold_for(class_id))
             continue;
 
         const float center_x = values[0];
@@ -378,7 +360,7 @@ auto decode_nms_rows(
             return failure_result("YOLO NMS output with 7 columns is not a supported layout");
         }
 
-        if (score < kConfidenceThreshold || x2 <= x1 || y2 <= y1)
+        if (score < confidence_threshold_for(class_id) || x2 <= x1 || y2 <= y1)
             continue;
 
         cv::Rect2f input_bbox{x1, y1, x2 - x1, y2 - y1};
@@ -426,7 +408,8 @@ auto decode_split_nms_outputs(const Frame& frame, const ModelRunResult& run_resu
     detections.reserve(detection_count);
     for (std::size_t index = 0; index < detection_count; ++index) {
         const float score = scores.values[index];
-        if (score < kConfidenceThreshold)
+        const int class_id = static_cast<std::int32_t>(classes.values[index]);
+        if (score < confidence_threshold_for(class_id))
             continue;
 
         const float* box = boxes.values.data() + index * 4;
@@ -438,7 +421,7 @@ auto decode_split_nms_outputs(const Frame& frame, const ModelRunResult& run_resu
         detections.push_back(
             DecodedDetection{
                 .score = score,
-                .class_id = static_cast<std::int32_t>(classes.values[index]),
+                .class_id = class_id,
                 .bbox = *bbox,
             });
     }

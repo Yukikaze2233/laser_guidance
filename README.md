@@ -8,15 +8,27 @@
 ## Features
 
 - **多后端采集** — V4L2/UVC 与 Hik 工业相机，由 `CaptureDevice` 统一 dispatch
-- **ONNX / TensorRT 推理** — 运行时切换，敌方颜色过滤，EKF 目标跟踪
-- **几何引导** — 相机标定 + 外参解算 → FT4222H USB-to-SPI 振镜控制（runtime 默认高速 SPI，smoke 工具默认保守低速）
+- **ONNX / TensorRT 推理** — 运行时切换，敌方颜色过滤，反制目标优先选中；CA 模型 EKF 像素平面跟踪 + 深度 1D 卡尔曼滤波
+- **几何引导** — 相机内参 + SE(3) 刚体变换（固定机械平移 + SO(3) 四元数旋转外参），双镜半角逆运动学，将带深度目标点转换为振镜角 → FT4222H USB-to-SPI 振镜控制
+- **Ceres 旋转标定** — 在 SO(3) 李群流形（`QuaternionManifold`）上优化旋转；使用带来源和不确定度的深度记录、完整近场镜距模型；平移固定为机械测量值
 - **空中机器人反制进度** — `HitProgress` 按 2026 规则计算 0.1s 阶梯增量、5 次锁定与 1/2/3 难度阶段
+- **全程引导裁判信号** — `RefereeLink` 订阅裁判系统 ZMQ（0x0001/0x020C），全程引导；game_progress 用于每局 HitProgress 重置与 0x020C 锁定校核，无信号/赛外退化纯本地计算；`tool_referee_sim` 提供本地 mock 验证
 - **硬件容错** — 相机或 FT4222 缺失时记录错误并继续运行；FT4222 作为 guidance 级运行时依赖，硬件恢复后自动重连
 - **ZMQ / UDP telemetry** — UDP 维持二进制 telemetry；ZMQ 发布 `cmd_id=0x2003` 的 Laser JSON 到 `tcp://*:5555`
 - **RTP 推流 + 录制** — h264_nvenc 编码，原始视频会话录制与离线抽帧导出
 - **调试桥接** — RosBridge → Foxglove Studio / rviz2 可视化检测框、跟踪轨迹、瞄准点
 - **FIFO 运行时控制** — `/tmp/laser_cmd` 接收 `stream on/off`、`record on/off`、`enemy red/blue` 等命令
 - **独立标定入口** — `tool_guidance` 用于相机标定与命中记录，不经过竞赛 runtime
+
+## 算法与状态估计
+
+### 李群方法
+
+- **相机↔振镜外参**：SE(3) 刚体变换，`R = Rz(-rz)·Ry(-rx)·Rx(-ry)` 四元数表示，平移为机械测量值
+- **SO(3) 旋转标定**：Ceres `QuaternionManifold` 在 **SO(3) 李群流形**上优化旋转（平移/镜距固定），近场双镜间距模型 + 深度不确定度加权；Wahba 仅作诊断/备用初值
+- **振镜逆运动学**：双镜半角解析解
+  `θx = ½·atan2(Px, √(Py² + Z²))`，`θy = ½·atan2(Py, Z)`，光学角 = 2×机械角；角度经线性映射到 DAC ±10V 驱动振镜
+- **瞄准合成**：EKF 外推位置 + 滤波深度 → 相机系 3D 点 → SE(3) 变换到振镜系 → 双镜逆解 → 叠加 `angle_offset_x/y_deg` 安装偏差补偿 → 振镜执行
 
 ## Quick Start
 
@@ -81,7 +93,7 @@ CaptureDevice → PerceptionRunner → TargetTrack → GuidanceSession → Runti
 |------|------|
 | `CaptureDevice` | 采集后端选择：v4l2 / hikcamera |
 | `PerceptionRunner` | ONNX / TensorRT 推理 + 敌方颜色过滤 + EKF 跟踪 |
-| `GuidanceSession` | FT4222H SPI 振镜控制 + 几何解算 + 瞄准执行 |
+| `GuidanceSession` | FT4222H SPI 振镜控制 + 几何解算（固定平移、四元数旋转、镜距模型）+ 瞄准执行 |
 | `RuntimeOutputs` | RTP 推流、SHM 共享内存、UDP/ZMQ telemetry、录制 |
 | `RosBridge` | RuntimeSnapshot → ROS2 topic（MarkerArray / Marker / Float64） |
 | `CompetitionRuntime` | main / preview profile，FIFO 命令入口 |
@@ -119,6 +131,8 @@ docker-build-laser --push   # 构建并推送镜像
 | Hik MVS SDK | submodule 自带 vendored SDK，或 `MVS_SDK_ROOT` |
 | ROS2 Jazzy | rclcpp、visualization_msgs、std_msgs |
 | ZMQ | libzmq3-dev、cppzmq-dev |
+| Eigen3 | 四元数旋转、向量和坐标变换 |
+| Ceres Solver | 固定平移下的相机-振镜 SO(3) 旋转标定 |
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -145,7 +159,7 @@ ctest --test-dir build --output-on-failure
 ./build/tool_record           # 录制工具
 ./build/tool_calibrate        # 相机标定
 ./build/tool_model_infer      # 模型推理测试
-./build/tool_calib_solve      # 外参解算
+./build/tool_calib_solve      # 深度感知旋转外参解算
 ./build/tool_export           # 录像抽帧导出
 ./build/tool_transcode        # 视频转码
 ```
@@ -165,7 +179,9 @@ ctest --test-dir build --output-on-failure
 include/              public API
 src/capture/          采集后端（v4l2 / hikcamera）
 src/vision/           推理与模型适配
-src/guidance/         几何解算与振镜控制
+src/guidance/         几何解算（固定平移、四元数旋转、深度估计、振镜控制）
+MotionPlanner         梯形速度规划 + 1ms 时间片直线插补（矩形/正弦扫描平滑轨迹）
+scan_path             矩形蛇形 / 正弦扫描路径点生成
 src/runtime/          运行时核心
 src/bridges/          FIFO / RTP / SHM / UDP / ZMQ / ROS2
 src/io/               硬件 I/O（FT4222H SPI）

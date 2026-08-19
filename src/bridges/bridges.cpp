@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <sstream>
 #include <utility>
+#include <vector>
 
 #include "streaming/rtp_streamer.hpp"
 #include "streaming/udp_sender.hpp"
@@ -67,13 +69,15 @@ FifoControlServer::FifoControlServer(std::filesystem::path fifo_path)
 
 FifoControlServer::~FifoControlServer() { stop(); }
 
-auto FifoControlServer::start() -> std::expected<void, std::string> {
+auto FifoControlServer::start() -> std::expected<void, Error> {
     stop();
     ::mkfifo(fifo_path_.c_str(), 0666);
     fd_ = ::open(fifo_path_.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd_ < 0) {
-        last_error_ = "failed to open FIFO: " + fifo_path_.string();
-        return std::unexpected(last_error_);
+        const auto err = make_error(
+            ErrorKind::device, "failed to open FIFO: " + fifo_path_.string());
+        last_error_ = format_error(err);
+        return std::unexpected(err);
     }
     last_error_.clear();
     return {};
@@ -126,7 +130,7 @@ auto FifoControlServer::consume_buffered_command() -> std::optional<RuntimeComma
         read_buffer_.erase(0, newline_pos + 1);
         auto parsed = parse_command(command_text);
         if (!parsed) {
-            last_error_ = parsed.error();
+            last_error_ = format_error(parsed.error());
             continue;
         }
         last_error_.clear();
@@ -135,48 +139,79 @@ auto FifoControlServer::consume_buffered_command() -> std::optional<RuntimeComma
 }
 
 auto FifoControlServer::parse_command(std::string_view text)
-    -> std::expected<RuntimeCommand, std::string> {
+    -> std::expected<RuntimeCommand, Error> {
     const auto normalized = lower_copy(trim_copy(std::string(text)));
     if (normalized.empty()) {
-        return std::unexpected("empty FIFO command");
+        return std::unexpected(make_error(ErrorKind::config, "empty FIFO command"));
     }
     if (normalized == "quit") {
-        return RuntimeCommand::shutdown();
+        return runtime_command::shutdown();
     }
     if (normalized == "stream on") {
-        return RuntimeCommand::set_streaming(true);
+        return runtime_command::set_streaming(true);
     }
     if (normalized == "stream off") {
-        return RuntimeCommand::set_streaming(false);
+        return runtime_command::set_streaming(false);
     }
     if (normalized == "record on") {
-        return RuntimeCommand::set_recording(true);
+        return runtime_command::set_recording(true);
     }
     if (normalized == "record off") {
-        return RuntimeCommand::set_recording(false);
+        return runtime_command::set_recording(false);
     }
     if (normalized == "enemy red") {
-        return RuntimeCommand::set_enemy_color(EnemyColor::red);
+        return runtime_command::set_enemy_color(EnemyColor::red);
     }
     if (normalized == "enemy blue") {
-        return RuntimeCommand::set_enemy_color(EnemyColor::blue);
+        return runtime_command::set_enemy_color(EnemyColor::blue);
     }
     if (normalized == "enemy auto") {
-        return RuntimeCommand::set_enemy_color(EnemyColor::auto_select);
+        return runtime_command::set_enemy_color(EnemyColor::auto_select);
     }
     if (normalized == "backend onnx") {
-        return RuntimeCommand::set_backend(RuntimeBackend::onnx);
+        return runtime_command::set_backend(RuntimeBackend::onnx);
     }
     if (normalized == "backend tensorrt") {
-        return RuntimeCommand::set_backend(RuntimeBackend::tensorrt);
+        return runtime_command::set_backend(RuntimeBackend::tensorrt);
     }
     if (normalized == "ekf on") {
-        return RuntimeCommand::set_ekf(true);
+        return runtime_command::set_ekf(true);
     }
     if (normalized == "ekf off") {
-        return RuntimeCommand::set_ekf(false);
+        return runtime_command::set_ekf(false);
     }
-    return std::unexpected("unsupported FIFO command: " + normalized);
+    if (normalized.starts_with("offset")) {
+        const auto rest = trim_copy(std::string(normalized).substr(6));
+        if (rest.empty()) {
+            return std::unexpected(make_error(ErrorKind::config, "offset requires a value"));
+        }
+        std::vector<float> values;
+        std::stringstream stream(rest);
+        std::string token;
+        while (stream >> token) {
+            try {
+                std::size_t consumed = 0;
+                values.push_back(std::stof(token, &consumed));
+                if (consumed != token.size()) {
+                    return std::unexpected(
+                        make_error(ErrorKind::config, "invalid offset value: " + token));
+                }
+            } catch (const std::exception&) {
+                return std::unexpected(
+                    make_error(ErrorKind::config, "invalid offset value: " + token));
+            }
+        }
+        if (values.size() == 1) {
+            return runtime_command::set_offset(values[0], 0.0F);
+        }
+        if (values.size() == 2) {
+            return runtime_command::set_offset(values[0], values[1]);
+        }
+        return std::unexpected(
+            make_error(ErrorKind::config, "offset expects <x_deg> [y_deg]"));
+    }
+    return std::unexpected(
+        make_error(ErrorKind::config, "unsupported FIFO command: " + normalized));
 }
 
 struct UdpTelemetryPublisher::Impl {

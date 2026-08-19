@@ -1,9 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
-project(laser_guidance LANGUAGES CXX)
+project(laser_guidance LANGUAGES CXX CUDA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+
+# CUDA: target the deployment GPU (Ada / sm_89). Adjust if the target changes.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 89)
+endif()
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# nvcc-generated host stubs trip -Wpedantic (# line directives); silence for CUDA only.
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Wno-pedantic")
 
 option(LASER_LTO        "Enable link-time optimization" OFF)
 option(LASER_UNITY      "Enable unity (jumbo) builds"  OFF)
@@ -28,13 +37,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # ---- dependencies -----------------------------------------------------------
-find_package(OpenCV REQUIRED COMPONENTS core highgui imgcodecs imgproc videoio)
+find_package(OpenCV REQUIRED COMPONENTS core highgui imgcodecs imgproc videoio dnn)
 if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
   find_package(OpenCV REQUIRED COMPONENTS calib geometry)
 else()
   find_package(OpenCV REQUIRED COMPONENTS calib3d)
 endif()
 find_package(yaml-cpp REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 # ZMQ (no cmake config shipped by distro)
 find_library(ZMQ_LIBRARY zmq)
@@ -49,6 +59,10 @@ set_target_properties(zmq::zmq PROPERTIES
   IMPORTED_LOCATION "${ZMQ_LIBRARY}"
   INTERFACE_INCLUDE_DIRECTORIES "${ZMQ_INCLUDE_DIR}")
 message(STATUS "ZMQ enabled")
+
+# ---- nlohmann_json ----------------------------------------------------------
+find_package(nlohmann_json REQUIRED)
+message(STATUS "nlohmann_json enabled")
 
 # ---- ONNX Runtime (required) -------------------------------------------------
 find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime/core/session/onnxruntime_cxx_api.h
@@ -140,6 +154,10 @@ find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 message(STATUS "ROS2 bridge enabled")
 
+# ---- Ceres Solver (calibration tool only) ----------------------------------
+find_package(Ceres REQUIRED)
+message(STATUS "Ceres enabled")
+
 # ---- Hikcamera (always enabled) ----------------------------------------------
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/hikcamera/CMakeLists.txt")
   message(FATAL_ERROR "Hikcamera requires vendor/hikcamera submodule. "
@@ -188,18 +206,22 @@ macro(add_lg_lib name)
 endmacro()
 
 # ---- source globs ------------------------------------------------------------
-file(GLOB_RECURSE laser_guidance_support_SOURCES CONFIGURE_DEPENDS
-  src/core/*.cpp
+set(laser_guidance_support_SOURCES
+  src/core/config.cpp
+  src/core/debug_renderer.cpp
+  src/core/frame_format.cpp
+  src/core/replay.cpp
   src/runtime/support.cpp
   src/runtime/runtime_command.cpp)
 file(GLOB_RECURSE laser_guidance_tracking_SOURCES CONFIGURE_DEPENDS src/tracking/*.cpp)
-file(GLOB_RECURSE laser_guidance_vision_SOURCES   CONFIGURE_DEPENDS src/vision/*.cpp)
+file(GLOB_RECURSE laser_guidance_vision_SOURCES   CONFIGURE_DEPENDS src/vision/*.cpp src/vision/*.cu)
 file(GLOB_RECURSE laser_guidance_guidance_SOURCES CONFIGURE_DEPENDS src/guidance/*.cpp)
 file(GLOB_RECURSE laser_guidance_bridges_SOURCES  CONFIGURE_DEPENDS src/streaming/*.cpp src/bridges/*.cpp)
 
 set(laser_guidance_runtime_SOURCES
   src/capture/capture_device.cpp
   src/capture/v4l2_capture.cpp
+  src/capture/hik_backend.cpp
   src/runtime/runtime.cpp
   src/runtime/control_loop.cpp
   src/runtime/guidance_ops_app.cpp
@@ -207,6 +229,7 @@ set(laser_guidance_runtime_SOURCES
   src/runtime/overlay_renderer.cpp
   src/runtime/perception_runner.cpp
   src/runtime/runtime_outputs.cpp
+  src/runtime/referee_link.cpp
   src/io/ft4222_spi.cpp)
 
 # ---- libraries ---------------------------------------------------------------
@@ -223,14 +246,15 @@ target_link_libraries(laser_guidance_vision PUBLIC
   CUDA::cudart CUDA::cuda)
 
 add_lg_lib(laser_guidance_guidance)
-target_link_libraries(laser_guidance_guidance PUBLIC laser_guidance_support)
+target_link_libraries(laser_guidance_guidance PUBLIC laser_guidance_support Eigen3::Eigen)
 
 add_lg_lib(laser_guidance_bridges)
 target_include_directories(laser_guidance_bridges PRIVATE
   ${rclcpp_INCLUDE_DIRS} ${visualization_msgs_INCLUDE_DIRS} ${std_msgs_INCLUDE_DIRS})
 target_link_libraries(laser_guidance_bridges PUBLIC
   laser_guidance_support laser_guidance_tracking
-  ${rclcpp_LIBRARIES} ${visualization_msgs_LIBRARIES} ${std_msgs_LIBRARIES})
+  ${rclcpp_LIBRARIES} ${visualization_msgs_LIBRARIES} ${std_msgs_LIBRARIES}
+  nlohmann_json::nlohmann_json)
 
 add_lg_lib(laser_guidance_runtime)
 target_link_libraries(laser_guidance_runtime PUBLIC
@@ -241,6 +265,21 @@ add_library(rmcs_laser_guidance_core INTERFACE)
 target_link_libraries(rmcs_laser_guidance_core INTERFACE
   laser_guidance_support laser_guidance_vision laser_guidance_tracking
   laser_guidance_guidance laser_guidance_bridges laser_guidance_runtime)
+
+# ---- libusb claim shim (LD_PRELOAD, 修复 MVS SDK U3V 控制传输不 claim 接口) ----
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBUSB1 QUIET IMPORTED_TARGET libusb-1.0)
+endif()
+if(LIBUSB1_FOUND)
+  add_library(libusb_claim_shim SHARED src/io/libusb_claim_shim.cpp)
+  target_include_directories(libusb_claim_shim PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${LIBUSB1_INCLUDE_DIRS})
+  target_link_libraries(libusb_claim_shim PRIVATE dl)
+  target_compile_features(libusb_claim_shim PRIVATE cxx_std_23)
+else()
+  message(WARNING "libusb-1.0 未找到，跳过 libusb_claim_shim（不影响主流程）")
+endif()
 
 # ---- RPATH assignments -------------------------------------------------------
 add_runtime_rpaths(laser_guidance_guidance)
@@ -258,14 +297,31 @@ add_custom_target(ft4222_runtime_link ALL
 # ---- tools -------------------------------------------------------------------
 enable_testing()
 
+add_library(laser_guidance_calibration STATIC tools/calib/rotation_calibrator.cpp)
+target_include_directories(laser_guidance_calibration PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+target_link_libraries(laser_guidance_calibration PUBLIC
+  rmcs_laser_guidance_core Eigen3::Eigen Ceres::ceres)
+add_runtime_rpaths(laser_guidance_calibration)
+
 file(GLOB TOOL_SOURCES CONFIGURE_DEPENDS tools/*.cpp)
 foreach(_src ${TOOL_SOURCES})
   get_filename_component(_name ${_src} NAME_WLE)
   add_executable(tool_${_name} ${_src})
   target_include_directories(tool_${_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
   target_link_libraries(tool_${_name} PRIVATE rmcs_laser_guidance_core)
+  if(_name STREQUAL "calib_solve")
+    target_link_libraries(tool_${_name} PRIVATE laser_guidance_calibration)
+  endif()
   if(_name STREQUAL "galvo_smoke" OR _name STREQUAL "dac8568_smoke")
     target_link_libraries(tool_${_name} PRIVATE ft4222::ft4222)
+  endif()
+  if(_name STREQUAL "cam_params_dump" OR _name STREQUAL "cam_grab")
+    target_link_libraries(tool_${_name} PRIVATE hikcamera)
+  endif()
+  if(_name STREQUAL "cam_list")
+    target_include_directories(tool_${_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hikcamera/src/sdk/include)
+    target_link_libraries(tool_${_name} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hikcamera/src/sdk/lib/libMvCameraControl.so)
   endif()
   add_runtime_rpaths(tool_${_name})
 endforeach()
@@ -283,6 +339,13 @@ foreach(_src ${TEST_SOURCES})
       laser_guidance_guidance laser_guidance_bridges laser_guidance_runtime)
   else()
     target_link_libraries(${_name} PRIVATE rmcs_laser_guidance_core)
+  endif()
+  if(_src MATCHES "tests/tools/")
+    target_link_libraries(${_name} PRIVATE laser_guidance_calibration)
+  endif()
+  if(_name STREQUAL "calib_solve_cli_test")
+    target_compile_definitions(${_name} PRIVATE CALIB_SOLVE_PATH="$<TARGET_FILE:tool_calib_solve>")
+    add_dependencies(${_name} tool_calib_solve)
   endif()
   add_runtime_rpaths(${_name})
   add_test(NAME ${_name} COMMAND ${_name})

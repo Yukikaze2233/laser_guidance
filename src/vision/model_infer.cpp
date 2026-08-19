@@ -1,18 +1,17 @@
 #include "vision/model_infer.hpp"
 
 #include "vision/cuda_check.hpp"
+#include <opencv2/imgproc.hpp>
 
-#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <print>
 #include <string>
 #include <utility>
 
-#include <opencv2/imgproc.hpp>
-
 #include "vision/model_adapter.hpp"
 #include "vision/model_runtime.hpp"
+#include "vision/preprocess_cuda.hpp"
 
 #include "vision/tensorrt_engine.hpp"
 
@@ -20,97 +19,21 @@ namespace rmcs_laser_guidance {
 
 namespace {
 
-constexpr int kInputWidth = 640;
-constexpr int kInputHeight = 640;
+constexpr int kDeploymentInputSize = 1216;
 
-struct LetterboxParams {
-    float scale = 1.0F;
-    int resized_width = kInputWidth;
-    int resized_height = kInputHeight;
-    float pad_x = 0.0F;
-    float pad_y = 0.0F;
-};
-
-struct TensorrtPreprocessResult {
-    std::vector<float> input;
-    LetterboxParams params;
-};
-
-auto compute_letterbox_params(int width, int height) -> LetterboxParams {
-    LetterboxParams params;
-    params.scale = std::min(
-        static_cast<float>(kInputWidth) / width, static_cast<float>(kInputHeight) / height);
-    params.resized_width = std::max(1, static_cast<int>(std::lround(width * params.scale)));
-    params.resized_height = std::max(1, static_cast<int>(std::lround(height * params.scale)));
-    params.pad_x = static_cast<float>((kInputWidth - params.resized_width) / 2);
-    params.pad_y = static_cast<float>((kInputHeight - params.resized_height) / 2);
-    return params;
-}
-
-auto preprocess_for_tensorrt(const cv::Mat& image) -> TensorrtPreprocessResult {
-    cv::Mat bgr;
-    if (image.channels() == 4)
-        cv::cvtColor(image, bgr, cv::COLOR_BGRA2BGR);
-    else if (image.channels() == 1)
-        cv::cvtColor(image, bgr, cv::COLOR_GRAY2BGR);
-    else
-        bgr = image;
-
-    const auto params = compute_letterbox_params(bgr.cols, bgr.rows);
-
-    cv::Mat resized;
-    cv::resize(
-        bgr, resized, cv::Size(params.resized_width, params.resized_height), 0.0, 0.0,
-        cv::INTER_LINEAR);
-
-    cv::Mat letterbox(kInputHeight, kInputWidth, CV_8UC3, cv::Scalar(114, 114, 114));
-    resized.copyTo(letterbox(
-        cv::Rect(
-            static_cast<int>(params.pad_x), static_cast<int>(params.pad_y), params.resized_width,
-            params.resized_height)));
-
-    cv::Mat rgb;
-    cv::cvtColor(letterbox, rgb, cv::COLOR_BGR2RGB);
-    cv::Mat rgb_float;
-    rgb.convertTo(rgb_float, CV_32F, 1.0 / 255.0);
-
-    std::vector<cv::Mat> channels;
-    cv::split(rgb_float, channels);
-
-    std::vector<float> input(3 * kInputHeight * kInputWidth);
-    std::size_t ch_size = kInputHeight * kInputWidth;
-    for (std::size_t c = 0; c < 3; ++c)
-        std::copy(
-            channels[c].ptr<float>(0), channels[c].ptr<float>(0) + ch_size,
-            input.begin() + c * ch_size);
-    return {
-        .input = std::move(input),
-        .params = params,
-    };
-}
-
-auto build_tensorrt_run_result(
-    const ModelRunResult& base, const std::vector<float>& output, std::int32_t input_w,
-    std::int32_t input_h, float scale, float pad_x, float pad_y) -> ModelRunResult {
-    ModelRunResult result;
-    result.success = true;
-    result.transform = ModelImageTransform{
-        .original_width = input_w,
-        .original_height = input_h,
-        .input_width = kInputWidth,
-        .input_height = kInputHeight,
-        .scale = scale,
-        .pad_x = pad_x,
-        .pad_y = pad_y,
-    };
-    result.outputs.push_back(
-        ModelTensorData{
-            .name = "output0",
-            .shape = {1, 300, 6},
-            .element_type = "float32",
-            .values = output,
-        });
-    return result;
+auto model_value_infos(const std::vector<TensorRTMeta::TensorInfo>& tensors)
+    -> std::vector<ModelValueInfo> {
+    std::vector<ModelValueInfo> values;
+    values.reserve(tensors.size());
+    for (const auto& tensor : tensors) {
+        values.push_back(
+            ModelValueInfo{
+                .name = tensor.name,
+                .shape = tensor.shape,
+                .element_type = "float32",
+            });
+    }
+    return values;
 }
 
 } // namespace
@@ -159,29 +82,91 @@ struct ModelInfer::Details {
     }
 
     auto make_base_result() const -> ModelInferResult {
+        std::vector<ModelValueInfo> inputs;
+        std::vector<ModelValueInfo> outputs;
+        if (tensorrt_engine) {
+            const auto& meta = tensorrt_engine->meta();
+            inputs = model_value_infos(meta.inputs);
+            outputs = model_value_infos(meta.outputs);
+        } else {
+            inputs = runtime.input_values();
+            outputs = runtime.output_values();
+        }
         return {
             .enabled = runtime_enabled,
             .success = false,
             .contract_supported = false,
             .observation = {},
             .candidates = {},
-            .inputs = runtime.input_values(),
-            .outputs = runtime.output_values(),
+            .inputs = std::move(inputs),
+            .outputs = std::move(outputs),
             .message = message,
         };
     }
 
     auto infer_tensorrt(const Frame& frame, ModelInferResult result) const -> ModelInferResult {
-        const auto preprocess = preprocess_for_tensorrt(frame.image);
-        std::vector<float> output(300 * 6);
-        auto run_result = tensorrt_engine->run(preprocess.input, output);
-        if (!run_result) {
-            result.message = "TensorRT inference: " + run_result.error();
+        const auto& meta = tensorrt_engine->meta();
+        if (meta.outputs.size() != 1 || meta.outputs.front().name != "output0") {
+            result.message = "TensorRT output contract requires exactly one output named output0";
             return result;
         }
-        auto run_model = build_tensorrt_run_result(
-            {}, output, frame.image.cols, frame.image.rows, preprocess.params.scale,
-            preprocess.params.pad_x, preprocess.params.pad_y);
+
+        std::vector<float> output;
+        std::vector<std::int64_t> output_shape;
+        const int out_size = kDeploymentInputSize;
+
+        // Fast GPU path: bypass CPU preprocess_blob entirely.
+        // Require continuous CV_8UC3 BGR; normalize if needed.
+        cv::Mat bgr = frame.image;
+        if (bgr.channels() == 1) {
+            cv::cvtColor(bgr, bgr, cv::COLOR_GRAY2BGR);
+        } else if (bgr.channels() == 4) {
+            cv::cvtColor(bgr, bgr, cv::COLOR_BGRA2BGR);
+        }
+        if (!bgr.isContinuous() || bgr.type() != CV_8UC3) {
+            bgr = bgr.clone();
+        }
+
+        auto run_result = tensorrt_engine->run_from_bgr(
+            bgr.data,
+            bgr.cols, bgr.rows,
+            out_size, out_size,
+            output, output_shape);
+
+        if (!run_result) {
+            result.message = "TensorRT inference (GPU preprocess): " + run_result.error();
+            return result;
+        }
+        if (output_shape != std::vector<std::int64_t>{1, 300, 6}) {
+            result.message = "TensorRT output contract requires resolved shape {1, 300, 6}";
+            return result;
+        }
+
+        // Compute the transform that maps model coords back to original image.
+        int scaled_w{}, scaled_h{}, pad_left{}, pad_top{};
+        preprocess_cuda_letterbox_params(
+            frame.image.cols, frame.image.rows, out_size, out_size,
+            scaled_w, scaled_h, pad_left, pad_top);
+        const float scale = static_cast<float>(scaled_w) / static_cast<float>(frame.image.cols);
+
+        ModelRunResult run_model;
+        run_model.success = true;
+        run_model.transform = ModelImageTransform{
+            .original_width  = frame.image.cols,
+            .original_height = frame.image.rows,
+            .input_width     = out_size,
+            .input_height    = out_size,
+            .scale           = scale,
+            .pad_x           = static_cast<float>(pad_left),
+            .pad_y           = static_cast<float>(pad_top),
+        };
+        run_model.outputs.push_back(
+            ModelTensorData{
+                .name = meta.outputs.front().name,
+                .shape = std::move(output_shape),
+                .element_type = "float32",
+                .values = output,
+            });
         auto adapter_result = adapt_yolo_outputs(frame, run_model);
         result.success = adapter_result.success;
         result.contract_supported = adapter_result.contract_supported;

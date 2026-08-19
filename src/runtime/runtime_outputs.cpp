@@ -1,5 +1,7 @@
 #include "runtime/runtime_outputs.hpp"
 
+#include <print>
+
 namespace rmcs_laser_guidance::runtime_internal {
 
 RuntimeOutputs::RuntimeOutputs(
@@ -39,24 +41,49 @@ auto RuntimeOutputs::apply_requests(
     }
 }
 
-auto RuntimeOutputs::publish_previous(cv::Mat& previous_output) -> void {
-    if (previous_output.empty()) {
+auto RuntimeOutputs::publish_frame(const cv::Mat& frame) -> void {
+    if (frame.empty()) {
         return;
     }
 
-    if (capabilities_.allow_shm && shm_active_) {
-        shm_publisher_.publish(previous_output);
+    const bool rtp_active = capabilities_.allow_rtp && rtp_publisher_.is_active();
+    // Full-res SHM memcpy (~15MB@5MP) on the main thread adds UI lag; skip when RTP
+    // already carries the preview (make stream / ffplay path).
+    if (capabilities_.allow_shm && shm_active_ && !rtp_active) {
+        shm_publisher_.publish(frame);
     }
 
-    if (capabilities_.allow_rtp && rtp_publisher_.is_active()) {
-        rtp_publisher_.publish(std::move(previous_output));
-        // cv::Mat move leaves source empty — no explicit reset needed
+    if (rtp_active) {
+        rtp_publisher_.publish(frame);
+    }
+}
+
+auto RuntimeOutputs::publish_frame(cv::Mat&& frame) -> void {
+    if (frame.empty()) {
+        return;
+    }
+
+    const bool rtp_active = capabilities_.allow_rtp && rtp_publisher_.is_active();
+    if (capabilities_.allow_shm && shm_active_ && !rtp_active) {
+        shm_publisher_.publish(frame);
+    }
+
+    if (rtp_active) {
+        rtp_publisher_.publish(std::move(frame));
     }
 }
 
 auto RuntimeOutputs::record_current(const cv::Mat& frame) -> void {
-    if (recorder_) {
+    if (!recorder_) {
+        return;
+    }
+    try {
         recorder_->record_frame(frame);
+    } catch (const std::exception& e) {
+        // Never let a recording hiccup escape into the hot loop (it would
+        // terminate the runtime thread); log and drop frames instead.
+        std::println(stderr, "recording: {}", e.what());
+        recorder_.reset();
     }
 }
 
@@ -136,7 +163,9 @@ auto RuntimeOutputs::begin_recording(const CaptureFormat& format) -> void {
             .distance_tag = record_options_.distance_tag,
             .target_color = record_options_.target_color,
             .operator_note_present = false,
-        });
+            .h264_qp = record_options_.h264_qp,
+        },
+        record_options_.h264_qp, config_.runtime.record_queue_size);
     recording_start_ = std::chrono::steady_clock::now();
 }
 
@@ -144,10 +173,14 @@ auto RuntimeOutputs::stop_recording() -> void {
     if (!recorder_) {
         return;
     }
-    const auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::steady_clock::now() - recording_start_)
-                                 .count();
-    recorder_->flush(duration_ms);
+    try {
+        const auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - recording_start_)
+                                     .count();
+        recorder_->flush(duration_ms);
+    } catch (const std::exception& e) {
+        std::println(stderr, "recording flush failed: {}", e.what());
+    }
     recorder_.reset();
 }
 
